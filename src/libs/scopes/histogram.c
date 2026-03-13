@@ -372,7 +372,7 @@ static void _hist_append_to_tooltip(const dt_scopes_mode_t *const self,
      && sev[HIST_ISSUE_SHADOW_CROWD] == 0.0f)
     sev[HIST_ISSUE_TOO_DARK] = HIST_DARK_MEAN - lum_mean;
 
-  if(span > 0 && span < HIST_LOW_CONTRAST_SPAN)
+  if(span < HIST_LOW_CONTRAST_SPAN)
     sev[HIST_ISSUE_LOW_CONTRAST] = (float)(HIST_LOW_CONTRAST_SPAN - span);
 
   if(max_ch_delta > HIST_COLOR_SKEW)

@@ -169,7 +169,7 @@ extern void lib_histogram_draw_bkgd(const dt_scopes_mode_t *const self,
                                     const int width,
                                     const int height);
 // FIXME: is there any reason this needs to be called with an argument?
-extern void lib_histogram_update_tooltip(const dt_scopes_t *const scopes);
+extern void lib_histogram_update_tooltip(dt_scopes_t *const scopes);
 
 #define dt_scopes_func_exists(mode, func) ((mode)->functions->func != NULL)
 
