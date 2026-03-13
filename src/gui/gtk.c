@@ -38,9 +38,6 @@
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
 
-#include <stdio.h>
-#include <glib/gstdio.h>
-
 #include "common/styles.h"
 #include "control/conf.h"
 #include "control/control.h"
@@ -4640,9 +4637,6 @@ void dt_gui_cursor_set_busy()
     dt_control_forbid_change_cursor();
     GtkWidget *toplevel = darktable.gui->ui->main_window;
     GdkWindow *window = gtk_widget_get_window(toplevel);
-    // #region agent log
-    { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"src/gui/gtk.c:4639\",\"message\":\"cursor_set_busy before cursor swap\",\"data\":{\"busyNest\":%d,\"toplevel\":\"%p\",\"window\":\"%p\"},\"timestamp\":%lld}\n", busy_nest_count, (void *)toplevel, (void *)window, (long long)g_get_real_time()); fclose(f); } }
-    // #endregion
     busy_prev_cursor = gdk_window_get_cursor(window);
     g_object_ref(busy_prev_cursor);
     GdkDisplay *display = gtk_widget_get_display(toplevel);
@@ -4672,9 +4666,6 @@ void dt_gui_cursor_clear_busy()
       // to restore the original mouse cursor
       GtkWidget *toplevel = darktable.gui->ui->main_window;
       GdkWindow *window = gtk_widget_get_window(toplevel);
-      // #region agent log
-      { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"C\",\"location\":\"src/gui/gtk.c:4668\",\"message\":\"cursor_clear_busy before cursor restore\",\"data\":{\"busyNest\":%d,\"toplevel\":\"%p\",\"window\":\"%p\",\"prevCursor\":\"%p\"},\"timestamp\":%lld}\n", busy_nest_count, (void *)toplevel, (void *)window, (void *)busy_prev_cursor, (long long)g_get_real_time()); fclose(f); } }
-      // #endregion
       gdk_window_set_cursor(window, busy_prev_cursor);
       g_object_unref(busy_prev_cursor);
       busy_prev_cursor = NULL;
