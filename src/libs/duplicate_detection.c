@@ -18,6 +18,8 @@
 
 #include "common/collection.h"
 #include "common/darktable.h"
+#include "common/database.h"
+#include "common/debug.h"
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
 #include "control/control.h"
@@ -25,9 +27,7 @@
 #include "dtgtk/thumbnail.h"
 #include "gui/gtk.h"
 #include "libs/lib.h"
-#include <glib/gstdio.h>
 #include <math.h>
-#include <stdio.h>
 #include <string.h>
 
 DT_MODULE(1)
@@ -39,19 +39,13 @@ static void _dd_debug_log(const char *hypothesis_id,
                           const char *message,
                           const char *data_json)
 {
-  FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a");
-  if(!f) return;
-
   const gint64 ts = g_get_real_time() / 1000;
-  fprintf(f,
-          "{\"hypothesisId\":\"%s\",\"location\":\"%s\",\"message\":\"%s\",\"data\":%s,\"timestamp\":%" G_GINT64_FORMAT
-          "}\n",
-          hypothesis_id ? hypothesis_id : "unknown",
-          location ? location : "unknown",
-          message ? message : "",
-          data_json ? data_json : "{}",
-          ts);
-  fclose(f);
+  dt_print(DT_DEBUG_ALWAYS, "[dup-detect][H:%s][ts:%" G_GINT64_FORMAT "] %s | %s | %s",
+           hypothesis_id ? hypothesis_id : "unknown",
+           ts,
+           location ? location : "unknown",
+           message ? message : "",
+           data_json ? data_json : "{}");
 }
 
 typedef struct _dd_entry_t
