@@ -26,8 +26,15 @@ G_BEGIN_DECLS
 #define DT_VIEW_RATINGS_MASK 0x7
 // first three bits of dt_view_image_over_t
 
+typedef gboolean (*dt_ratings_auto_progress_callback)(gpointer user_data,
+                                                      guint done,
+                                                      guint total);
+
 /** get rating for the specified image */
 int dt_ratings_get(const dt_imgid_t imgid);
+
+/** derive an automatic star rating for the specified image */
+int dt_ratings_auto_score_image(const dt_imgid_t imgid);
 
 /** apply rating to the specified image */
 void dt_ratings_apply_on_image(const dt_imgid_t imgid,
@@ -40,6 +47,12 @@ void dt_ratings_apply_on_image(const dt_imgid_t imgid,
 void dt_ratings_apply_on_list(const GList *list,
                               const int rating,
                               const gboolean undo_on);
+
+/** automatically rate all images in the list and return the number processed */
+guint dt_ratings_apply_auto_on_list(const GList *list,
+                                    const gboolean undo_on,
+                                    dt_ratings_auto_progress_callback progress_callback,
+                                    gpointer user_data);
 
 extern const struct dt_action_def_t dt_action_def_rating;
 

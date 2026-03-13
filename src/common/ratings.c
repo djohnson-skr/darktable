@@ -19,6 +19,7 @@
 #include "common/darktable.h"
 #include "common/debug.h"
 #include "common/image_cache.h"
+#include "common/mipmap_cache.h"
 #include "common/ratings.h"
 #include "common/undo.h"
 #include "common/grouping.h"
@@ -27,6 +28,8 @@
 #include "control/control.h"
 #include "gui/gtk.h"
 #include "gui/accelerators.h"
+
+#include <math.h>
 
 #define DT_RATINGS_UPGRADE -1
 #define DT_RATINGS_DOWNGRADE -2
@@ -55,8 +58,95 @@ int dt_ratings_get(const dt_imgid_t imgid)
   return stars;
 }
 
+static int _ratings_auto_score_from_thumbnail(const dt_mipmap_buffer_t *const buf)
+{
+  if(!buf || !buf->buf || buf->width < 2 || buf->height < 2) return DT_VIEW_STAR_1;
+
+  float *previous_row = g_malloc0_n(buf->width, sizeof(float));
+  if(!previous_row) return DT_VIEW_STAR_1;
+
+  const uint8_t *pixels = buf->buf;
+  const uint64_t pixel_count = (uint64_t)buf->width * buf->height;
+  double luma_sum = 0.0;
+  double luma_sq_sum = 0.0;
+  double saturation_sum = 0.0;
+  double edge_sum = 0.0;
+  uint64_t edge_samples = 0;
+  uint64_t clipped_shadows = 0;
+  uint64_t clipped_highlights = 0;
+
+  for(int y = 0; y < buf->height; y++)
+  {
+    float left_luma = 0.0f;
+    for(int x = 0; x < buf->width; x++)
+    {
+      const uint8_t *pixel = pixels + 4 * ((size_t)y * buf->width + x);
+      const float c0 = pixel[0] / 255.0f;
+      const float c1 = pixel[1] / 255.0f;
+      const float c2 = pixel[2] / 255.0f;
+      const float luma = (c0 + c1 + c2) / 3.0f;
+      const float max_channel = MAX(c0, MAX(c1, c2));
+      const float min_channel = MIN(c0, MIN(c1, c2));
+
+      luma_sum += luma;
+      luma_sq_sum += luma * luma;
+      saturation_sum += max_channel > 0.001f ? (max_channel - min_channel) / max_channel : 0.0f;
+
+      if(luma < 0.04f)
+        clipped_shadows++;
+      else if(luma > 0.96f)
+        clipped_highlights++;
+
+      if(x > 0)
+      {
+        edge_sum += fabsf(luma - left_luma);
+        edge_samples++;
+      }
+      if(y > 0)
+      {
+        edge_sum += fabsf(luma - previous_row[x]);
+        edge_samples++;
+      }
+
+      previous_row[x] = luma;
+      left_luma = luma;
+    }
+  }
+
+  g_free(previous_row);
+
+  const double mean_luma = luma_sum / pixel_count;
+  const double variance = MAX(0.0, (luma_sq_sum / pixel_count) - mean_luma * mean_luma);
+  const double contrast_score = MIN(1.0, sqrt(variance) / 0.22);
+  const double detail_score = edge_samples > 0 ? MIN(1.0, (edge_sum / edge_samples) / 0.16) : 0.0;
+  const double color_score = MIN(1.0, (saturation_sum / pixel_count) / 0.40);
+  const double exposure_score = 1.0 - MIN(1.0, fabs(mean_luma - 0.45) / 0.35);
+  const double clipping_penalty
+      = MIN(1.0, (clipped_shadows + clipped_highlights) / (pixel_count * 0.25));
+
+  double score = 0.45 * detail_score + 0.20 * contrast_score + 0.15 * color_score + 0.20 * exposure_score;
+  score *= 1.0 - 0.35 * clipping_penalty;
+
+  return CLAMP((int)floor(score * 4.0 + 1.5), DT_VIEW_STAR_1, DT_VIEW_STAR_5);
+}
+
+int dt_ratings_auto_score_image(const dt_imgid_t imgid)
+{
+  if(!dt_is_valid_imgid(imgid)) return DT_VIEW_STAR_1;
+
+  dt_mipmap_buffer_t buf = { 0 };
+  int rating = DT_VIEW_STAR_1;
+
+  dt_mipmap_cache_get(&buf, imgid, DT_MIPMAP_1, DT_MIPMAP_BLOCKING, 'r');
+  if(buf.buf) rating = _ratings_auto_score_from_thumbnail(&buf);
+  dt_mipmap_cache_release(&buf);
+
+  return rating;
+}
+
 static void _ratings_apply_to_image(const dt_imgid_t imgid,
-                                    const int rating)
+                                    const int rating,
+                                    const gboolean raise_signal)
 {
   dt_image_t *image = dt_image_cache_get(imgid, 'w');
 
@@ -75,7 +165,8 @@ static void _ratings_apply_to_image(const dt_imgid_t imgid,
     // synch through:
     dt_image_cache_write_release_info(image, DT_IMAGE_CACHE_SAFE,
                                       "_ratings_apply_to_image");
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
+    if(raise_signal)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
   }
 }
 
@@ -87,15 +178,20 @@ static void _pop_undo(gpointer user_data,
 {
   if(type == DT_UNDO_RATINGS)
   {
+    gboolean changed = FALSE;
     for(GList *list = (GList *)data; list; list = g_list_next(list))
     {
       dt_undo_ratings_t *ratings = list->data;
       _ratings_apply_to_image(ratings->imgid,
                               (action == DT_ACTION_UNDO)
                               ? ratings->before
-                              : ratings->after);
+                              : ratings->after,
+                              FALSE);
       *imgs = g_list_prepend(*imgs, GINT_TO_POINTER(ratings->imgid));
+      changed = TRUE;
     }
+    if(changed)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
     dt_collection_hint_message(darktable.collection);
   }
 }
@@ -188,7 +284,7 @@ static void _ratings_apply(const GList *imgs,
     else if(rating == DT_VIEW_REJECT && !toggle)
       new_rating = DT_RATINGS_REJECT;
 
-    _ratings_apply_to_image(image_id, new_rating);
+    _ratings_apply_to_image(image_id, new_rating, TRUE);
   }
 }
 
@@ -214,6 +310,57 @@ void dt_ratings_apply_on_list(const GList *img,
     dt_gui_cursor_clear_busy();
     dt_collection_hint_message(darktable.collection);
   }
+}
+
+guint dt_ratings_apply_auto_on_list(const GList *imgs,
+                                    const gboolean undo_on,
+                                    dt_ratings_auto_progress_callback progress_callback,
+                                    gpointer user_data)
+{
+  if(g_list_is_empty(imgs)) return 0;
+
+  GList *undo = NULL;
+  const guint total = g_list_length((GList *)imgs);
+  guint done = 0;
+
+  for(const GList *images = imgs; images; images = g_list_next(images))
+  {
+    if(progress_callback && !progress_callback(user_data, done, total)) break;
+
+    const dt_imgid_t image_id = GPOINTER_TO_INT(images->data);
+    const int old_rating = dt_ratings_get(image_id);
+    const int new_rating = dt_ratings_auto_score_image(image_id);
+
+    if(undo_on)
+    {
+      dt_undo_ratings_t *undoratings = malloc(sizeof(dt_undo_ratings_t));
+      undoratings->imgid = image_id;
+      undoratings->before = old_rating;
+      undoratings->after = new_rating;
+      undo = g_list_prepend(undo, undoratings);
+    }
+
+    _ratings_apply_to_image(image_id, new_rating, FALSE);
+    done++;
+  }
+
+  if(progress_callback) progress_callback(user_data, done, total);
+
+  if(undo_on && undo)
+  {
+    undo = g_list_reverse(undo);
+    dt_undo_start_group(darktable.undo, DT_UNDO_RATINGS);
+    dt_undo_record(darktable.undo, NULL, DT_UNDO_RATINGS, undo, _pop_undo, _ratings_undo_data_free);
+    dt_undo_end_group(darktable.undo);
+  }
+
+  if(done > 0)
+  {
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
+    dt_collection_hint_message(darktable.collection);
+  }
+
+  return done;
 }
 
 void dt_ratings_apply_on_image(const dt_imgid_t imgid,
