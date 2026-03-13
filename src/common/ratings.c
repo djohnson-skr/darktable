@@ -323,9 +323,6 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
   const guint total = g_list_length((GList *)imgs);
   guint done = 0;
 
-  if(undo_on)
-    dt_undo_start_group(darktable.undo, DT_UNDO_RATINGS);
-
   for(const GList *images = imgs; images; images = g_list_next(images))
   {
     if(progress_callback && !progress_callback(user_data, done, total)) break;
@@ -349,13 +346,11 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
 
   if(progress_callback) progress_callback(user_data, done, total);
 
-  if(undo_on)
+  if(undo_on && undo)
   {
-    if(undo)
-    {
-      undo = g_list_reverse(undo);
-      dt_undo_record(darktable.undo, NULL, DT_UNDO_RATINGS, undo, _pop_undo, _ratings_undo_data_free);
-    }
+    undo = g_list_reverse(undo);
+    dt_undo_start_group(darktable.undo, DT_UNDO_RATINGS);
+    dt_undo_record(darktable.undo, NULL, DT_UNDO_RATINGS, undo, _pop_undo, _ratings_undo_data_free);
     dt_undo_end_group(darktable.undo);
   }
 
