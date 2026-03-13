@@ -145,7 +145,8 @@ int dt_ratings_auto_score_image(const dt_imgid_t imgid)
 }
 
 static void _ratings_apply_to_image(const dt_imgid_t imgid,
-                                    const int rating)
+                                    const int rating,
+                                    const gboolean raise_signal)
 {
   dt_image_t *image = dt_image_cache_get(imgid, 'w');
 
@@ -164,7 +165,8 @@ static void _ratings_apply_to_image(const dt_imgid_t imgid,
     // synch through:
     dt_image_cache_write_release_info(image, DT_IMAGE_CACHE_SAFE,
                                       "_ratings_apply_to_image");
-    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
+    if(raise_signal)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
   }
 }
 
@@ -182,7 +184,8 @@ static void _pop_undo(gpointer user_data,
       _ratings_apply_to_image(ratings->imgid,
                               (action == DT_ACTION_UNDO)
                               ? ratings->before
-                              : ratings->after);
+                              : ratings->after,
+                              TRUE);
       *imgs = g_list_prepend(*imgs, GINT_TO_POINTER(ratings->imgid));
     }
     dt_collection_hint_message(darktable.collection);
@@ -277,7 +280,7 @@ static void _ratings_apply(const GList *imgs,
     else if(rating == DT_VIEW_REJECT && !toggle)
       new_rating = DT_RATINGS_REJECT;
 
-    _ratings_apply_to_image(image_id, new_rating);
+    _ratings_apply_to_image(image_id, new_rating, TRUE);
   }
 }
 
@@ -336,7 +339,7 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
       undo = g_list_append(undo, undoratings);
     }
 
-    _ratings_apply_to_image(image_id, new_rating);
+    _ratings_apply_to_image(image_id, new_rating, FALSE);
     done++;
   }
 
@@ -349,7 +352,11 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
     dt_undo_end_group(darktable.undo);
   }
 
-  if(done > 0) dt_collection_hint_message(darktable.collection);
+  if(done > 0)
+  {
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
+    dt_collection_hint_message(darktable.collection);
+  }
 
   return done;
 }

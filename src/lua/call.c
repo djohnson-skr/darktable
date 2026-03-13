@@ -663,7 +663,7 @@ static int gtk_wrap(lua_State*L)
     g_cond_init(&communication.end_cond);
     communication.L = L;
     communication.retval = -1;
-    g_idle_add_full(G_PRIORITY_HIGH_IDLE, dt_lua_gtk_wrap_callback, &communication, NULL);
+    g_main_context_invoke_full(NULL, G_PRIORITY_HIGH_IDLE, dt_lua_gtk_wrap_callback, &communication, NULL);
     g_mutex_lock(&communication.end_mutex);
     while(communication.retval == -1)
       g_cond_wait(&communication.end_cond,&communication.end_mutex);
