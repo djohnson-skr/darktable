@@ -19,6 +19,7 @@
 #include "common/ratings.h"
 #include "common/collection.h"
 #include "common/debug.h"
+#include "control/jobs.h"
 #include "control/control.h"
 #include "dtgtk/button.h"
 #include "gui/draw.h"
@@ -36,6 +37,11 @@ typedef struct dt_lib_ratings_t
   gint pointery;
 } dt_lib_ratings_t;
 
+typedef struct dt_lib_ratings_job_t
+{
+  GList *imgs;
+} dt_lib_ratings_job_t;
+
 /* redraw the ratings */
 static gboolean _lib_ratings_draw_callback(GtkWidget *widget, cairo_t *cr, dt_lib_module_t *self);
 /* motion notify handler*/
@@ -50,6 +56,11 @@ static gboolean _lib_ratings_button_press_callback(GtkWidget *widget, GdkEventBu
 /* button release handler */
 static gboolean _lib_ratings_button_release_callback(GtkWidget *widget, GdkEventButton *event,
                                                      dt_lib_module_t *self);
+static void _lib_ratings_auto_rate_clicked_callback(GtkWidget *widget, dt_lib_module_t *self);
+static gboolean _lib_ratings_auto_rate_progress(gpointer user_data, guint done, guint total);
+static int32_t _lib_ratings_auto_rate_job_run(dt_job_t *job);
+static void _lib_ratings_auto_rate_job_cleanup(void *user_data);
+static void _lib_ratings_start_auto_rate(void);
 
 const char *name(dt_lib_module_t *self)
 {
@@ -82,11 +93,12 @@ void gui_init(dt_lib_module_t *self)
   dt_lib_ratings_t *d = g_malloc0(sizeof(dt_lib_ratings_t));
   self->data = (void *)d;
 
-  self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0));
+  self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_PIXEL_APPLY_DPI(6)));
   gtk_widget_set_halign(self->widget, GTK_ALIGN_CENTER);
   gtk_widget_set_valign(self->widget, GTK_ALIGN_CENTER);
 
   GtkWidget *drawing = gtk_drawing_area_new();
+  gtk_widget_set_size_request(drawing, DT_PIXEL_APPLY_DPI(100), DT_PIXEL_APPLY_DPI(20));
 
   gtk_widget_set_events(drawing, GDK_EXPOSURE_MASK     | GDK_POINTER_MOTION_MASK
                                | GDK_ENTER_NOTIFY_MASK | GDK_LEAVE_NOTIFY_MASK
@@ -103,7 +115,16 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(drawing), "motion-notify-event", G_CALLBACK(_lib_ratings_motion_notify_callback), self);
   g_signal_connect(G_OBJECT(drawing), "leave-notify-event", G_CALLBACK(_lib_ratings_leave_notify_callback), self);
 
-  gtk_box_pack_start(GTK_BOX(self->widget), drawing, TRUE, TRUE, 0);
+  gtk_box_pack_start(GTK_BOX(self->widget), drawing, FALSE, FALSE, 0);
+
+  GtkWidget *auto_rate_button = gtk_button_new_with_label(_("Auto-rate library"));
+  gtk_widget_set_name(auto_rate_button, "lib-rating-auto-button");
+  gtk_widget_set_tooltip_text(auto_rate_button,
+                              _("analyze every image in the current collection and assign 1-5 stars automatically"));
+  dt_gui_add_class(auto_rate_button, "suggested-action");
+  g_signal_connect(G_OBJECT(auto_rate_button), "clicked",
+                   G_CALLBACK(_lib_ratings_auto_rate_clicked_callback), self);
+  gtk_box_pack_start(GTK_BOX(self->widget), auto_rate_button, FALSE, FALSE, 0);
 
   /* set size of navigation draw area */
   gtk_widget_set_name(self->widget, "lib-rating-stars");
@@ -209,6 +230,91 @@ static gboolean _lib_ratings_button_release_callback(GtkWidget *widget, GdkEvent
                                                      dt_lib_module_t *self)
 {
   return TRUE;
+}
+
+static gboolean _lib_ratings_auto_rate_progress(gpointer user_data, guint done, guint total)
+{
+  dt_job_t *job = user_data;
+
+  if(total > 0)
+    dt_control_job_set_progress(job, CLAMP(done / (double)total, 0.0, 1.0));
+
+  return dt_control_job_get_state(job) != DT_JOB_STATE_CANCELLED;
+}
+
+static int32_t _lib_ratings_auto_rate_job_run(dt_job_t *job)
+{
+  dt_lib_ratings_job_t *params = dt_control_job_get_params(job);
+  const guint total = g_list_length(params->imgs);
+
+  if(total == 0)
+  {
+    dt_control_log(_("no images in the current collection to auto-rate"));
+    return 0;
+  }
+
+  dt_control_job_set_progress_message(job, ngettext("auto-rating %d image",
+                                                    "auto-rating %d images", total), total);
+
+  const guint done = dt_ratings_apply_auto_on_list(params->imgs, TRUE, _lib_ratings_auto_rate_progress, job);
+
+  if(dt_control_job_get_state(job) == DT_JOB_STATE_CANCELLED)
+    dt_control_log(ngettext("auto-rating stopped after %d image",
+                            "auto-rating stopped after %d images", done), done);
+  else
+    dt_control_log(ngettext("auto-rated %d image",
+                            "auto-rated %d images", done), done);
+
+  dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
+                             DT_COLLECTION_PROP_RATING_RANGE, params->imgs);
+  dt_control_queue_redraw_center();
+  return 0;
+}
+
+static void _lib_ratings_auto_rate_job_cleanup(void *user_data)
+{
+  dt_lib_ratings_job_t *params = user_data;
+  g_list_free(params->imgs);
+  g_free(params);
+}
+
+static void _lib_ratings_start_auto_rate(void)
+{
+  GList *imgs = dt_collection_get_all(darktable.collection, -1);
+  const guint total = g_list_length(imgs);
+
+  if(total == 0)
+  {
+    g_list_free(imgs);
+    dt_control_log(_("no images in the current collection to auto-rate"));
+    return;
+  }
+
+  dt_job_t *job = dt_control_job_create(_lib_ratings_auto_rate_job_run, "auto-rate %d images", total);
+  if(!job)
+  {
+    g_list_free(imgs);
+    return;
+  }
+
+  dt_lib_ratings_job_t *params = g_malloc0(sizeof(*params));
+  params->imgs = imgs;
+  dt_control_job_set_params(job, params, _lib_ratings_auto_rate_job_cleanup);
+
+  gchar *message = g_strdup_printf(ngettext("analyzing %d image for automatic star ratings",
+                                            "analyzing %d images for automatic star ratings", total),
+                                   total);
+  dt_control_job_add_progress(job, message, TRUE);
+  g_free(message);
+
+  dt_control_add_job(DT_JOB_QUEUE_USER_BG, job);
+}
+
+static void _lib_ratings_auto_rate_clicked_callback(GtkWidget *widget, dt_lib_module_t *self)
+{
+  (void)widget;
+  (void)self;
+  _lib_ratings_start_auto_rate();
 }
 
 static gboolean _lib_ratings_leave_notify_callback(GtkWidget *widget, GdkEventCrossing *event,
