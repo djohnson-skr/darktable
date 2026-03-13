@@ -178,6 +178,7 @@ static void _pop_undo(gpointer user_data,
 {
   if(type == DT_UNDO_RATINGS)
   {
+    gboolean changed = FALSE;
     for(GList *list = (GList *)data; list; list = g_list_next(list))
     {
       dt_undo_ratings_t *ratings = list->data;
@@ -185,9 +186,12 @@ static void _pop_undo(gpointer user_data,
                               (action == DT_ACTION_UNDO)
                               ? ratings->before
                               : ratings->after,
-                              TRUE);
+                              FALSE);
       *imgs = g_list_prepend(*imgs, GINT_TO_POINTER(ratings->imgid));
+      changed = TRUE;
     }
+    if(changed)
+      DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_METADATA_CHANGED, DT_METADATA_SIGNAL_NEW_VALUE);
     dt_collection_hint_message(darktable.collection);
   }
 }
@@ -336,7 +340,7 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
       undoratings->imgid = image_id;
       undoratings->before = old_rating;
       undoratings->after = new_rating;
-      undo = g_list_append(undo, undoratings);
+      undo = g_list_prepend(undo, undoratings);
     }
 
     _ratings_apply_to_image(image_id, new_rating, FALSE);
@@ -348,7 +352,10 @@ guint dt_ratings_apply_auto_on_list(const GList *imgs,
   if(undo_on)
   {
     if(undo)
+    {
+      undo = g_list_reverse(undo);
       dt_undo_record(darktable.undo, NULL, DT_UNDO_RATINGS, undo, _pop_undo, _ratings_undo_data_free);
+    }
     dt_undo_end_group(darktable.undo);
   }
 
