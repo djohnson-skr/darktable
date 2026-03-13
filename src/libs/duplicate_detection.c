@@ -25,6 +25,7 @@
 #include "dtgtk/thumbnail.h"
 #include "gui/gtk.h"
 #include "libs/lib.h"
+#include <glib/gstdio.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,7 +39,7 @@ static void _dd_debug_log(const char *hypothesis_id,
                           const char *message,
                           const char *data_json)
 {
-  FILE *f = fopen("/opt/cursor/logs/debug.log", "a");
+  FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a");
   if(!f) return;
 
   const gint64 ts = g_get_real_time() / 1000;
