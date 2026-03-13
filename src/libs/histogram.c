@@ -271,14 +271,10 @@ static gboolean _drawable_draw_callback(GtkWidget *widget,
   return FALSE;
 }
 
-void lib_histogram_update_tooltip(const dt_scopes_t *const scopes)
+void lib_histogram_update_tooltip(dt_scopes_t *const scopes)
 {
   const char *const scope_name = dt_scopes_call(scopes->cur_mode, name);
-  gchar *tip = g_strdup_printf("%s\n(%s)\n%s\n%s",
-                               _(scope_name),
-                               _("use buttons at top of graph to change type"),
-                               _("click on ❓ and then graph for documentation"),
-                               _("use color picker module to restrict area"));
+  gchar *tip = g_strdup_printf("%s", _(scope_name));
   if(scopes->highlight == DT_SCOPES_HIGHLIGHT_BLACK_POINT)
     dt_util_str_cat(&tip, "\n%s\n%s",
                           _("drag to change black point"),
@@ -287,7 +283,9 @@ void lib_histogram_update_tooltip(const dt_scopes_t *const scopes)
     dt_util_str_cat(&tip, "\n%s\n%s",
                           _("drag to change exposure"),
                     _("double-click resets"));
+  dt_pthread_mutex_lock(&scopes->lock);
   dt_scopes_call_if_exists(scopes->cur_mode, append_to_tooltip, &tip);
+  dt_pthread_mutex_unlock(&scopes->lock);
   gtk_widget_set_tooltip_text(scopes->scope_draw, tip);
   g_free(tip);
 }
