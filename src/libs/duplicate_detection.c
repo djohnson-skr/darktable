@@ -34,20 +34,6 @@ DT_MODULE(1)
 
 #define _DD_TIME_WINDOW_US (15 * 60 * G_TIME_SPAN_SECOND)
 
-static void _dd_debug_log(const char *hypothesis_id,
-                          const char *location,
-                          const char *message,
-                          const char *data_json)
-{
-  const gint64 ts = g_get_real_time() / 1000;
-  dt_print(DT_DEBUG_ALWAYS, "[dup-detect][H:%s][ts:%" G_GINT64_FORMAT "] %s | %s | %s",
-           hypothesis_id ? hypothesis_id : "unknown",
-           ts,
-           location ? location : "unknown",
-           message ? message : "",
-           data_json ? data_json : "{}");
-}
-
 typedef struct _dd_entry_t
 {
   dt_imgid_t imgid;
@@ -264,13 +250,6 @@ static GPtrArray *_build_duplicate_groups(int *out_count)
   GList *imgs = dt_collection_get_all(darktable.collection, -1);
   const int n = g_list_length(imgs);
   if(out_count) *out_count = n;
-  {
-    char data[96];
-    g_snprintf(data, sizeof(data), "{\"imageCount\":%d}", n);
-    // #region agent log
-    _dd_debug_log("B", "duplicate_detection.c:_build_duplicate_groups", "collection loaded", data);
-    // #endregion
-  }
 
   GPtrArray *groups = g_ptr_array_new_with_free_func(_group_result_free);
   if(n < 2)
@@ -284,20 +263,10 @@ static GPtrArray *_build_duplicate_groups(int *out_count)
   int *rank = g_malloc0_n(n, sizeof(int));
 
   sqlite3_stmt *sha_stmt = NULL;
-  const int sha_prepare_rc
-      = sqlite3_prepare_v2(dt_database_get(darktable.db), "SELECT sha1sum FROM main.images WHERE id = ?1", -1,
-                           &sha_stmt, NULL);
-  {
-    char data[128];
-    g_snprintf(data, sizeof(data), "{\"prepareRc\":%d,\"stmtNull\":%s}", sha_prepare_rc,
-               sha_stmt ? "false" : "true");
-    // #region agent log
-    _dd_debug_log("A", "duplicate_detection.c:_build_duplicate_groups", "sha1 statement prepare", data);
-    // #endregion
-  }
+  sqlite3_prepare_v2(dt_database_get(darktable.db), "SELECT sha1sum FROM main.images WHERE id = ?1", -1, &sha_stmt,
+                     NULL);
 
   int i = 0;
-  gboolean logged_sha_stmt_missing = FALSE;
   for(GList *l = imgs; l; l = g_list_next(l), i++)
   {
     const dt_imgid_t imgid = GPOINTER_TO_INT(l->data);
@@ -325,14 +294,6 @@ static GPtrArray *_build_duplicate_groups(int *out_count)
       }
       DT_DEBUG_SQLITE3_RESET(sha_stmt);
       DT_DEBUG_SQLITE3_CLEAR_BINDINGS(sha_stmt);
-    }
-    else if(!logged_sha_stmt_missing)
-    {
-      // #region agent log
-      _dd_debug_log("A", "duplicate_detection.c:_build_duplicate_groups",
-                    "sha1 statement unavailable; skipping sha1 path", "{\"usedFallback\":true}");
-      // #endregion
-      logged_sha_stmt_missing = TRUE;
     }
 
     _compute_signature(imgid, &entries[i]);
@@ -606,13 +567,6 @@ static void _populate_results_window(dt_lib_module_t *self, GPtrArray *groups)
   if(!self || !self->data || !groups) return;
 
   dt_lib_duplicate_detection_t *d = self->data;
-  {
-    char data[128];
-    g_snprintf(data, sizeof(data), "{\"incomingGroups\":%u}", groups->len);
-    // #region agent log
-    _dd_debug_log("C", "duplicate_detection.c:_populate_results_window", "result window start", data);
-    // #endregion
-  }
 
   if(d->result_window)
   {
@@ -704,13 +658,6 @@ static void _populate_results_window(dt_lib_module_t *self, GPtrArray *groups)
       }
       else
       {
-        char data[128];
-        g_snprintf(data, sizeof(data), "{\"imgid\":%d,\"thumbNull\":%s}", (int)imgid,
-                   item->thumb ? "false" : "true");
-        // #region agent log
-        _dd_debug_log("D", "duplicate_detection.c:_populate_results_window",
-                      "thumbnail creation returned unusable widget", data);
-        // #endregion
         if(item->thumb)
         {
           dt_thumbnail_destroy(item->thumb);
@@ -757,13 +704,6 @@ static void _populate_results_window(dt_lib_module_t *self, GPtrArray *groups)
   gtk_box_pack_end(GTK_BOX(buttons), close_btn, FALSE, FALSE, 0);
 
   _update_summary(d);
-  {
-    char data[128];
-    g_snprintf(data, sizeof(data), "{\"renderedGroups\":%u}", d->groups ? d->groups->len : 0);
-    // #region agent log
-    _dd_debug_log("C", "duplicate_detection.c:_populate_results_window", "result window ready", data);
-    // #endregion
-  }
   gtk_widget_show_all(d->result_window);
 }
 
@@ -773,14 +713,6 @@ static void _detect_duplicates_clicked(GtkButton *button, gpointer user_data)
   if(!self || !self->data) return;
   dt_lib_duplicate_detection_t *d = self->data;
   if(!d->detect_button) return;
-  {
-    char data[160];
-    g_snprintf(data, sizeof(data), "{\"buttonNull\":%s,\"buttonSensitive\":%s}", d->detect_button ? "false" : "true",
-               (d->detect_button && gtk_widget_get_sensitive(d->detect_button)) ? "true" : "false");
-    // #region agent log
-    _dd_debug_log("B", "duplicate_detection.c:_detect_duplicates_clicked", "detect click entry", data);
-    // #endregion
-  }
   gtk_widget_set_sensitive(d->detect_button, FALSE);
 
   int scanned = 0;
@@ -789,13 +721,6 @@ static void _detect_duplicates_clicked(GtkButton *button, gpointer user_data)
   {
     gtk_widget_set_sensitive(d->detect_button, TRUE);
     return;
-  }
-  {
-    char data[160];
-    g_snprintf(data, sizeof(data), "{\"scanned\":%d,\"groupCount\":%u}", scanned, groups->len);
-    // #region agent log
-    _dd_debug_log("B", "duplicate_detection.c:_detect_duplicates_clicked", "detect click after build", data);
-    // #endregion
   }
 
   if(groups->len == 0)
