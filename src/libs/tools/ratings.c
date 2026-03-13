@@ -266,7 +266,7 @@ static int32_t _lib_ratings_auto_rate_job_run(dt_job_t *job)
                             "auto-rated %d images", done), done);
 
   dt_collection_update_query(darktable.collection, DT_COLLECTION_CHANGE_RELOAD,
-                             DT_COLLECTION_PROP_RATING_RANGE, params->imgs);
+                             DT_COLLECTION_PROP_RATING_RANGE, g_list_copy(params->imgs));
   dt_control_queue_redraw_center();
   return 0;
 }
