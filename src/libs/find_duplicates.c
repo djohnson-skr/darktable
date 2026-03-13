@@ -676,6 +676,19 @@ static gpointer _detect_thread(gpointer user_data)
   char      **sha1_arr  = g_malloc0_n(n, sizeof(char *));
   int         n_skipped = 0;
 
+  /* Check once whether sha1sum column exists (removed in schema v42). */
+  gboolean has_sha1sum = FALSE;
+  {
+    sqlite3_stmt *chk = NULL;
+    if(sqlite3_prepare_v2(dt_database_get(darktable.db),
+        "SELECT 1 FROM pragma_table_info('images') WHERE name='sha1sum'",
+        -1, &chk, NULL) == SQLITE_OK)
+    {
+      if(chk && sqlite3_step(chk) == SQLITE_ROW) has_sha1sum = TRUE;
+      if(chk) sqlite3_finalize(chk);
+    }
+  }
+
   int idx = 0;
   for(GList *l = ids; l; l = l->next, idx++)
   {
@@ -683,6 +696,7 @@ static gpointer _detect_thread(gpointer user_data)
     img_arr[idx] = imgid;
 
     /* SHA-1 exact hash from the database ---------------------------------- */
+    if(has_sha1sum)
     {
       sqlite3_stmt *stmt;
       DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
@@ -856,18 +870,8 @@ static void _on_detect_clicked(GtkWidget *btn, gpointer user_data)
   gtk_label_set_text(GTK_LABEL(d->status_label), _("Detecting duplicates…"));
 
   /* Collect image IDs from the current collection on the main thread.
-   * The 'memory.collected_images' virtual table is populated by darktable
-   * whenever the collection changes and is safe to query directly. */
-  GList *all_ids = NULL;
-  {
-    sqlite3_stmt *stmt;
-    DT_DEBUG_SQLITE3_PREPARE_V2(dt_database_get(darktable.db),
-        "SELECT imgid FROM memory.collected_images", -1, &stmt, NULL);
-    while(sqlite3_step(stmt) == SQLITE_ROW)
-      all_ids = g_list_prepend(all_ids, GINT_TO_POINTER(sqlite3_column_int(stmt, 0)));
-    sqlite3_finalize(stmt);
-    all_ids = g_list_reverse(all_ids);
-  }
+   * Use dt_collection_get_all() which is the safe high-level API. */
+  GList *all_ids = dt_collection_get_all(darktable.collection, -1);
 
   if(!all_ids)
   {
