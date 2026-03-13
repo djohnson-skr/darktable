@@ -28,7 +28,7 @@
 #define HIST_SHADOW_EDGE_BINS 16
 #define HIST_HIGHLIGHT_EDGE_BINS 16
 #define HIST_CLIP_THRESHOLD_PCT 0.5f
-#define HIST_CROWD_THRESHOLD_PCT 5.0f
+#define HIST_CROWD_THRESHOLD_PCT 8.0f
 #define HIST_DARK_MEAN 85.0f
 #define HIST_BRIGHT_MEAN 170.0f
 #define HIST_LOW_CONTRAST_SPAN 128
@@ -342,7 +342,9 @@ static void _hist_append_to_tooltip(const dt_scopes_mode_t *const self,
 
   // Score each potential issue; zero means not triggered
   float sev[HIST_ISSUE_N];
+  float rank_sev[HIST_ISSUE_N];
   memset(sev, 0, sizeof(sev));
+  memset(rank_sev, 0, sizeof(rank_sev));
 
   if(highlight_edge_pct > HIST_CLIP_THRESHOLD_PCT)
     sev[HIST_ISSUE_HIGHLIGHT_CLIP] = highlight_edge_pct;
@@ -376,11 +378,37 @@ static void _hist_append_to_tooltip(const dt_scopes_mode_t *const self,
   if(max_ch_delta > HIST_COLOR_SKEW)
     sev[HIST_ISSUE_COLOR_CAST] = max_ch_delta - HIST_COLOR_SKEW;
 
-  // Rank issues by severity (insertion sort, descending)
+  // Normalize issue scores to a common scale before ranking
+  if(sev[HIST_ISSUE_HIGHLIGHT_CLIP] > 0.0f)
+    rank_sev[HIST_ISSUE_HIGHLIGHT_CLIP]
+      = sev[HIST_ISSUE_HIGHLIGHT_CLIP] / HIST_CLIP_THRESHOLD_PCT;
+  if(sev[HIST_ISSUE_SHADOW_CLIP] > 0.0f)
+    rank_sev[HIST_ISSUE_SHADOW_CLIP]
+      = sev[HIST_ISSUE_SHADOW_CLIP] / HIST_CLIP_THRESHOLD_PCT;
+  if(sev[HIST_ISSUE_HIGHLIGHT_CROWD] > 0.0f)
+    rank_sev[HIST_ISSUE_HIGHLIGHT_CROWD]
+      = sev[HIST_ISSUE_HIGHLIGHT_CROWD] / HIST_CROWD_THRESHOLD_PCT;
+  if(sev[HIST_ISSUE_SHADOW_CROWD] > 0.0f)
+    rank_sev[HIST_ISSUE_SHADOW_CROWD]
+      = sev[HIST_ISSUE_SHADOW_CROWD] / HIST_CROWD_THRESHOLD_PCT;
+  if(sev[HIST_ISSUE_TOO_BRIGHT] > 0.0f)
+    rank_sev[HIST_ISSUE_TOO_BRIGHT]
+      = sev[HIST_ISSUE_TOO_BRIGHT] / (255.0f - HIST_BRIGHT_MEAN);
+  if(sev[HIST_ISSUE_TOO_DARK] > 0.0f)
+    rank_sev[HIST_ISSUE_TOO_DARK]
+      = sev[HIST_ISSUE_TOO_DARK] / HIST_DARK_MEAN;
+  if(sev[HIST_ISSUE_LOW_CONTRAST] > 0.0f)
+    rank_sev[HIST_ISSUE_LOW_CONTRAST]
+      = sev[HIST_ISSUE_LOW_CONTRAST] / HIST_LOW_CONTRAST_SPAN;
+  if(sev[HIST_ISSUE_COLOR_CAST] > 0.0f)
+    rank_sev[HIST_ISSUE_COLOR_CAST]
+      = sev[HIST_ISSUE_COLOR_CAST] / HIST_COLOR_SKEW;
+
+  // Rank issues by normalized severity (insertion sort, descending)
   int ranked[HIST_ISSUE_N];
   for(int i = 0; i < HIST_ISSUE_N; i++) ranked[i] = i;
   for(int i = 1; i < HIST_ISSUE_N; i++)
-    for(int j = i; j > 0 && sev[ranked[j]] > sev[ranked[j - 1]]; j--)
+    for(int j = i; j > 0 && rank_sev[ranked[j]] > rank_sev[ranked[j - 1]]; j--)
     {
       const int tmp = ranked[j];
       ranked[j] = ranked[j - 1];
@@ -391,7 +419,7 @@ static void _hist_append_to_tooltip(const dt_scopes_mode_t *const self,
   int n_suggestions = 0;
   for(int r = 0; r < HIST_ISSUE_N && n_suggestions < 3; r++)
   {
-    if(sev[ranked[r]] <= 0.0f) break;
+    if(rank_sev[ranked[r]] <= 0.0f) break;
     const int issue = ranked[r];
     const char *text = NULL;
     switch(issue)
@@ -423,10 +451,19 @@ static void _hist_append_to_tooltip(const dt_scopes_mode_t *const self,
       case HIST_ISSUE_COLOR_CAST:
       {
         const float r_excess = ch_mean[0] - lum_mean;
+        const float g_excess = ch_mean[1] - lum_mean;
         const float b_excess = ch_mean[2] - lum_mean;
-        text = r_excess > b_excess
-          ? _("Warm color cast — adjust white balance")
-          : _("Cool color cast — adjust white balance");
+        const float abs_r_excess = fabsf(r_excess);
+        const float abs_g_excess = fabsf(g_excess);
+        const float abs_b_excess = fabsf(b_excess);
+        if(abs_g_excess > abs_r_excess && abs_g_excess > abs_b_excess)
+          text = g_excess > 0.0f
+            ? _("Green color cast — adjust tint")
+            : _("Magenta color cast — adjust tint");
+        else
+          text = r_excess > b_excess
+            ? _("Warm color cast — adjust white balance")
+            : _("Cool color cast — adjust white balance");
         break;
       }
       default:
