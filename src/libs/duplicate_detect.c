@@ -33,14 +33,16 @@
 #include <gdk/gdkkeysyms.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 DT_MODULE(1)
 
 #define DHASH_SIZE 8
 #define DHASH_BITS (DHASH_SIZE * DHASH_SIZE)
-#define HAMMING_THRESHOLD 12
+#define HAMMING_THRESHOLD 8
 #define TIMESTAMP_THRESHOLD_SEC 5
 
 typedef struct dt_lib_duplicate_detect_t
@@ -53,11 +55,12 @@ typedef struct _dhash_entry_t
   dt_imgid_t imgid;
   uint64_t dhash;
   gboolean has_hash;
+  gboolean has_valid_maker;
+  float avg_r, avg_g, avg_b;
   char filename[PATH_MAX];
-  char sha1[41];
-  char datetime[20];
-  char maker[64];
-  char model[128];
+  int64_t datetime_taken;
+  int maker_id;
+  int model_id;
   int width;
   int height;
 } _dhash_entry_t;
@@ -162,23 +165,45 @@ static void _get_image_info(_dhash_entry_t *entry)
   sqlite3_stmt *stmt;
   DT_DEBUG_SQLITE3_PREPARE_V2(
     dt_database_get(darktable.db),
-    "SELECT filename, COALESCE(sha1sum, ''), COALESCE(datetime_taken, ''),"
-    " COALESCE(maker, ''), COALESCE(model, ''), width, height"
-    " FROM main.images WHERE id = ?1",
+    "SELECT i.filename, i.datetime_taken, i.maker_id, i.model_id,"
+    " i.width, i.height, COALESCE(m.name, '')"
+    " FROM main.images AS i"
+    " LEFT JOIN main.makers AS m ON i.maker_id = m.id"
+    " WHERE i.id = ?1",
     -1, &stmt, NULL);
   DT_DEBUG_SQLITE3_BIND_INT(stmt, 1, entry->imgid);
 
   if(sqlite3_step(stmt) == SQLITE_ROW)
   {
-    g_strlcpy(entry->filename, (const char *)sqlite3_column_text(stmt, 0), sizeof(entry->filename));
-    g_strlcpy(entry->sha1, (const char *)sqlite3_column_text(stmt, 1), sizeof(entry->sha1));
-    g_strlcpy(entry->datetime, (const char *)sqlite3_column_text(stmt, 2), sizeof(entry->datetime));
-    g_strlcpy(entry->maker, (const char *)sqlite3_column_text(stmt, 3), sizeof(entry->maker));
-    g_strlcpy(entry->model, (const char *)sqlite3_column_text(stmt, 4), sizeof(entry->model));
-    entry->width = sqlite3_column_int(stmt, 5);
-    entry->height = sqlite3_column_int(stmt, 6);
+    const char *fn = (const char *)sqlite3_column_text(stmt, 0);
+    if(fn) g_strlcpy(entry->filename, fn, sizeof(entry->filename));
+    entry->datetime_taken = sqlite3_column_int64(stmt, 1);
+    entry->maker_id = sqlite3_column_int(stmt, 2);
+    entry->model_id = sqlite3_column_int(stmt, 3);
+    entry->width = sqlite3_column_int(stmt, 4);
+    entry->height = sqlite3_column_int(stmt, 5);
+    const char *maker_name = (const char *)sqlite3_column_text(stmt, 6);
+    entry->has_valid_maker = (maker_name && maker_name[0] != '\0');
   }
   sqlite3_finalize(stmt);
+}
+
+static void _compute_avg_color(const uint8_t *buf, int w, int h,
+                               float *avg_r, float *avg_g, float *avg_b)
+{
+  double sum_r = 0, sum_g = 0, sum_b = 0;
+  const int n = w * h;
+  if(n == 0) { *avg_r = *avg_g = *avg_b = 0; return; }
+
+  for(int i = 0; i < n; i++)
+  {
+    sum_r += buf[i * 4 + 0];
+    sum_g += buf[i * 4 + 1];
+    sum_b += buf[i * 4 + 2];
+  }
+  *avg_r = (float)(sum_r / n);
+  *avg_g = (float)(sum_g / n);
+  *avg_b = (float)(sum_b / n);
 }
 
 static void _compute_image_dhash(_dhash_entry_t *entry)
@@ -189,46 +214,96 @@ static void _compute_image_dhash(_dhash_entry_t *entry)
   if(buf.buf && buf.width > 0 && buf.height > 0)
   {
     entry->dhash = _compute_dhash(buf.buf, buf.width, buf.height);
+    _compute_avg_color(buf.buf, buf.width, buf.height,
+                       &entry->avg_r, &entry->avg_g, &entry->avg_b);
     entry->has_hash = TRUE;
   }
   else
   {
     entry->dhash = 0;
+    entry->avg_r = entry->avg_g = entry->avg_b = 0;
     entry->has_hash = FALSE;
   }
 
   dt_mipmap_cache_release(&buf);
 }
 
+static gboolean _files_are_identical(const dt_imgid_t id_a, const dt_imgid_t id_b)
+{
+  char path_a[PATH_MAX] = { 0 };
+  char path_b[PATH_MAX] = { 0 };
+  dt_image_full_path(id_a, path_a, sizeof(path_a), NULL);
+  dt_image_full_path(id_b, path_b, sizeof(path_b), NULL);
+  if(!path_a[0] || !path_b[0]) return FALSE;
+
+  struct stat sa, sb;
+  if(g_stat(path_a, &sa) != 0 || g_stat(path_b, &sb) != 0)
+    return FALSE;
+  if(sa.st_size != sb.st_size)
+    return FALSE;
+
+  FILE *fa = g_fopen(path_a, "rb");
+  FILE *fb = g_fopen(path_b, "rb");
+  if(!fa || !fb)
+  {
+    if(fa) fclose(fa);
+    if(fb) fclose(fb);
+    return FALSE;
+  }
+
+  gboolean identical = TRUE;
+  uint8_t buf_a[8192], buf_b[8192];
+  while(!feof(fa))
+  {
+    const size_t ra = fread(buf_a, 1, sizeof(buf_a), fa);
+    const size_t rb = fread(buf_b, 1, sizeof(buf_b), fb);
+    if(ra != rb || memcmp(buf_a, buf_b, ra) != 0)
+    {
+      identical = FALSE;
+      break;
+    }
+  }
+
+  fclose(fa);
+  fclose(fb);
+  return identical;
+}
+
+#define COLOR_DIST_THRESHOLD 30.0f
+
+static float _color_distance(const _dhash_entry_t *a, const _dhash_entry_t *b)
+{
+  const float dr = a->avg_r - b->avg_r;
+  const float dg = a->avg_g - b->avg_g;
+  const float db = a->avg_b - b->avg_b;
+  return sqrtf(dr * dr + dg * dg + db * db);
+}
+
 static gboolean _are_potential_duplicates(const _dhash_entry_t *a, const _dhash_entry_t *b)
 {
-  if(a->sha1[0] && b->sha1[0] && strcmp(a->sha1, b->sha1) == 0)
+  if(_files_are_identical(a->imgid, b->imgid))
     return TRUE;
 
   if(a->has_hash && b->has_hash)
   {
     const int dist = _hamming_distance(a->dhash, b->dhash);
-    if(dist <= HAMMING_THRESHOLD)
+    const float cdist = _color_distance(a, b);
+    if(dist <= HAMMING_THRESHOLD && cdist <= COLOR_DIST_THRESHOLD)
       return TRUE;
   }
 
-  if(a->datetime[0] && b->datetime[0]
-     && a->maker[0] && b->maker[0]
-     && strcmp(a->maker, b->maker) == 0
-     && strcmp(a->model, b->model) == 0)
+  if(a->datetime_taken > 0 && b->datetime_taken > 0
+     && a->maker_id > 0 && b->maker_id > 0
+     && a->has_valid_maker && b->has_valid_maker
+     && a->maker_id == b->maker_id
+     && a->model_id == b->model_id)
   {
-    int y1, m1, d1, h1, min1, s1;
-    int y2, m2, d2, h2, min2, s2;
-    if(sscanf(a->datetime, "%d:%d:%d %d:%d:%d", &y1, &m1, &d1, &h1, &min1, &s1) == 6
-       && sscanf(b->datetime, "%d:%d:%d %d:%d:%d", &y2, &m2, &d2, &h2, &min2, &s2) == 6)
-    {
-      const long ts1 = ((long)y1 * 365 * 24 + m1 * 30 * 24 + d1 * 24 + h1) * 3600 + min1 * 60 + s1;
-      const long ts2 = ((long)y2 * 365 * 24 + m2 * 30 * 24 + d2 * 24 + h2) * 3600 + min2 * 60 + s2;
-      if(labs(ts1 - ts2) <= TIMESTAMP_THRESHOLD_SEC
-         && abs(a->width - b->width) <= 10
-         && abs(a->height - b->height) <= 10)
-        return TRUE;
-    }
+    const int64_t dt_usec = 1000000LL;
+    const int64_t diff = llabs(a->datetime_taken - b->datetime_taken);
+    if(diff <= TIMESTAMP_THRESHOLD_SEC * dt_usec
+       && abs(a->width - b->width) <= 10
+       && abs(a->height - b->height) <= 10)
+      return TRUE;
   }
 
   return FALSE;
