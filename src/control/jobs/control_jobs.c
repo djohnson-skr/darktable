@@ -49,6 +49,8 @@
 #include <gio/gio.h>
 #include <glib.h>
 #include <glib/gstdio.h>
+#include <json-glib/json-glib.h>
+#include <math.h>
 #ifndef _WIN32
 #include <glob.h>
 #endif
@@ -84,6 +86,11 @@ typedef struct dt_control_gpx_apply_t
   gchar *filename;
   gchar *tz;
 } dt_control_gpx_apply_t;
+
+typedef struct dt_control_geo_guess_t
+{
+  gchar *command;
+} dt_control_geo_guess_t;
 
 typedef struct dt_control_export_t
 {
@@ -1470,6 +1477,335 @@ bail_out:
   return 1;
 }
 
+static gboolean _json_object_get_double_member(const JsonObject *obj,
+                                               const char *member,
+                                               double *value)
+{
+  if(!json_object_has_member((JsonObject *)obj, member)) return FALSE;
+
+  JsonNode *node = json_object_get_member((JsonObject *)obj, member);
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)) return FALSE;
+
+  const GType type = json_node_get_value_type(node);
+  if(type == G_TYPE_STRING)
+  {
+    const char *text = json_node_get_string(node);
+    if(!text || !*text) return FALSE;
+
+    char *end = NULL;
+    const double parsed = g_ascii_strtod(text, &end);
+    if(end == text || (end && *end != '\0')) return FALSE;
+    *value = parsed;
+    return TRUE;
+  }
+
+  if(type == G_TYPE_DOUBLE || type == G_TYPE_INT64 || type == G_TYPE_INT
+     || type == G_TYPE_UINT64 || type == G_TYPE_UINT)
+  {
+    *value = json_node_get_double(node);
+    return TRUE;
+  }
+
+  return FALSE;
+}
+
+static gboolean _json_object_get_double_member_any(const JsonObject *obj,
+                                                   const char *const *members,
+                                                   const size_t num_members,
+                                                   double *value)
+{
+  for(size_t i = 0; i < num_members; i++)
+    if(_json_object_get_double_member(obj, members[i], value)) return TRUE;
+
+  return FALSE;
+}
+
+static gchar *_json_object_dup_string_member_any(const JsonObject *obj,
+                                                 const char *const *members,
+                                                 const size_t num_members)
+{
+  for(size_t i = 0; i < num_members; i++)
+  {
+    if(json_object_has_member((JsonObject *)obj, members[i]))
+      return g_strdup(json_object_get_string_member((JsonObject *)obj, members[i]));
+  }
+
+  return NULL;
+}
+
+static gboolean _control_geo_guess_run_helper(const char *command,
+                                              const dt_imgid_t imgid,
+                                              dt_image_geoloc_t *geoloc,
+                                              gchar **place,
+                                              double *confidence,
+                                              gchar **reasoning,
+                                              gchar **error_msg)
+{
+  if(place) *place = NULL;
+  if(confidence) *confidence = NAN;
+  if(reasoning) *reasoning = NULL;
+  if(error_msg) *error_msg = NULL;
+
+  if(!command || !*command)
+  {
+    if(error_msg) *error_msg = g_strdup(_("geo guesser helper command is empty"));
+    return FALSE;
+  }
+
+  char image_path[PATH_MAX] = { 0 };
+  dt_image_full_path(imgid, image_path, sizeof(image_path), NULL);
+  if(!image_path[0] || !g_file_test(image_path, G_FILE_TEST_EXISTS))
+  {
+    if(error_msg) *error_msg = g_strdup(_("image file is unavailable"));
+    return FALSE;
+  }
+
+  gint argc = 0;
+  gchar **base_argv = NULL;
+  GError *error = NULL;
+  if(!g_shell_parse_argv(command, &argc, &base_argv, &error))
+  {
+    if(error_msg) *error_msg = g_strdup(error->message);
+    g_clear_error(&error);
+    return FALSE;
+  }
+
+  gchar **argv = g_new0(gchar *, argc + 5);
+  for(int i = 0; i < argc; i++) argv[i] = g_strdup(base_argv[i]);
+  argv[argc + 0] = g_strdup("--image");
+  argv[argc + 1] = g_strdup(image_path);
+  argv[argc + 2] = g_strdup("--imgid");
+  argv[argc + 3] = g_strdup_printf("%d", imgid);
+  g_strfreev(base_argv);
+
+  gchar *stdout_buf = NULL;
+  gchar *stderr_buf = NULL;
+  gint exit_status = 0;
+  if(!g_spawn_sync(NULL, argv, NULL, G_SPAWN_SEARCH_PATH, NULL, NULL,
+                   &stdout_buf, &stderr_buf, &exit_status, &error))
+  {
+    if(error_msg) *error_msg = g_strdup(error->message);
+    g_clear_error(&error);
+    g_strfreev(argv);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+  g_strfreev(argv);
+
+  if(!g_spawn_check_exit_status(exit_status, &error))
+  {
+    if(error_msg)
+      *error_msg = stderr_buf && *stderr_buf ? g_strdup(stderr_buf) : g_strdup(error->message);
+    g_clear_error(&error);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  if(!stdout_buf || !*g_strstrip(stdout_buf))
+  {
+    if(error_msg)
+      *error_msg = stderr_buf && *stderr_buf ? g_strdup(stderr_buf)
+                                             : g_strdup(_("geo guesser helper returned no JSON"));
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  JsonParser *parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, stdout_buf, -1, &error))
+  {
+    if(error_msg)
+      *error_msg = stderr_buf && *stderr_buf ? g_strdup(stderr_buf) : g_strdup(error->message);
+    g_clear_error(&error);
+    g_object_unref(parser);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(!root || !JSON_NODE_HOLDS_OBJECT(root))
+  {
+    if(error_msg) *error_msg = g_strdup(_("geo guesser helper must return a JSON object"));
+    g_object_unref(parser);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  static const char *const lat_keys[] = { "latitude", "lat" };
+  static const char *const lon_keys[] = { "longitude", "lon", "lng" };
+  static const char *const ele_keys[] = { "elevation", "altitude" };
+  static const char *const place_keys[] = { "place", "location_name", "name" };
+  static const char *const reasoning_keys[] = { "reasoning", "summary" };
+
+  JsonObject *obj = json_node_get_object(root);
+  double latitude = NAN;
+  double longitude = NAN;
+  if(!_json_object_get_double_member_any(obj, lat_keys, G_N_ELEMENTS(lat_keys), &latitude)
+     || !_json_object_get_double_member_any(obj, lon_keys, G_N_ELEMENTS(lon_keys), &longitude))
+  {
+    if(error_msg) *error_msg = g_strdup(_("geo guesser helper must return latitude and longitude"));
+    g_object_unref(parser);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  if(!isfinite(latitude) || !isfinite(longitude) || latitude < -90.0 || latitude > 90.0
+     || longitude < -180.0 || longitude > 180.0)
+  {
+    if(error_msg) *error_msg = g_strdup(_("geo guesser helper returned coordinates outside valid range"));
+    g_object_unref(parser);
+    g_free(stdout_buf);
+    g_free(stderr_buf);
+    return FALSE;
+  }
+
+  geoloc->latitude = latitude;
+  geoloc->longitude = longitude;
+  geoloc->elevation = NAN;
+  (void)_json_object_get_double_member_any(obj, ele_keys, G_N_ELEMENTS(ele_keys), &geoloc->elevation);
+  if(confidence)
+    (void)_json_object_get_double_member(obj, "confidence", confidence);
+  if(place)
+    *place = _json_object_dup_string_member_any(obj, place_keys, G_N_ELEMENTS(place_keys));
+  if(reasoning)
+    *reasoning = _json_object_dup_string_member_any(obj, reasoning_keys, G_N_ELEMENTS(reasoning_keys));
+
+  g_object_unref(parser);
+  g_free(stdout_buf);
+  g_free(stderr_buf);
+  return TRUE;
+}
+
+static int32_t _control_geo_guess_job_run(dt_job_t *job)
+{
+  dt_control_image_enumerator_t *params = dt_control_job_get_params(job);
+  GList *t = params->index;
+  const dt_control_geo_guess_t *d = params->data;
+  double fraction = 0.0;
+
+  if(!t)
+  {
+    dt_control_log(_("no images selected for geo guess"));
+    return 1;
+  }
+
+  if(!d || !d->command || !*d->command)
+  {
+    dt_control_log(_("set a geo guesser helper command first"));
+    return 1;
+  }
+
+  const guint total = g_list_length(t);
+  double prev_time = 0.0;
+  char message[512] = { 0 };
+  g_snprintf(message, sizeof(message),
+             ngettext("guessing geo-location", "guessing geo-location for %u images", total), total);
+  dt_control_job_set_progress_message(job, message);
+
+  GList *imgs = NULL;
+  GArray *gloc = g_array_new(FALSE, FALSE, sizeof(dt_image_geoloc_t));
+  guint guessed = 0;
+  guint updated = 0;
+  guint failed = 0;
+  gchar *single_place = NULL;
+  double single_confidence = NAN;
+  dt_image_geoloc_t single_geoloc = { NAN, NAN, NAN };
+
+  for(; t && !_job_cancelled(job); t = g_list_next(t))
+  {
+    const dt_imgid_t imgid = GPOINTER_TO_INT(t->data);
+    dt_image_geoloc_t geoloc = { NAN, NAN, NAN };
+    gchar *place = NULL;
+    gchar *reasoning = NULL;
+    gchar *error_msg = NULL;
+    double confidence = NAN;
+
+    if(_control_geo_guess_run_helper(d->command, imgid, &geoloc, &place, &confidence,
+                                     &reasoning, &error_msg))
+    {
+      GList *grps = dt_grouping_get_group_images(imgid);
+      for(GList *grp = grps; grp; grp = g_list_next(grp))
+      {
+        imgs = g_list_prepend(imgs, grp->data);
+        g_array_append_val(gloc, geoloc);
+        updated++;
+      }
+      g_list_free(grps);
+
+      if(total == 1)
+      {
+        single_geoloc = geoloc;
+        single_confidence = confidence;
+        single_place = place;
+        place = NULL;
+        if(reasoning && *reasoning)
+          dt_print(DT_DEBUG_DEV, "[geo guess] reasoning for %d: %s", imgid, reasoning);
+      }
+
+      guessed++;
+    }
+    else
+    {
+      gchar *filename = dt_image_get_filename(imgid);
+      dt_control_log(_("geo guess failed for `%s`: %s"),
+                     filename ? filename : _("selected image"),
+                     error_msg ? error_msg : _("invalid helper response"));
+      g_free(filename);
+      failed++;
+    }
+
+    g_free(place);
+    g_free(reasoning);
+    g_free(error_msg);
+
+    fraction += 1.0 / total;
+    _update_progress(job, fraction, &prev_time);
+  }
+
+  if(imgs)
+  {
+    imgs = g_list_reverse(imgs);
+    dt_image_set_images_locations(imgs, gloc, TRUE);
+    DT_CONTROL_SIGNAL_RAISE(DT_SIGNAL_GEOTAG_CHANGED, imgs, 0);
+  }
+  else
+  {
+    g_list_free(imgs);
+  }
+
+  if(guessed == 1 && total == 1)
+  {
+    if(single_place && isfinite(single_confidence))
+      dt_control_log(_("geo guess applied: %s (%.5f, %.5f, confidence %.2f)"),
+                     single_place, single_geoloc.latitude, single_geoloc.longitude,
+                     single_confidence);
+    else if(single_place)
+      dt_control_log(_("geo guess applied: %s (%.5f, %.5f)"),
+                     single_place, single_geoloc.latitude, single_geoloc.longitude);
+    else
+      dt_control_log(_("geo guess applied: %.5f, %.5f"),
+                     single_geoloc.latitude, single_geoloc.longitude);
+  }
+  else if(updated > 0)
+  {
+    dt_control_log(ngettext("applied guessed geo-location to %u image",
+                            "applied guessed geo-location to %u images", updated), updated);
+  }
+
+  if(failed > 0)
+    dt_control_log(ngettext("geo guess failed for %u image",
+                            "geo guess failed for %u images", failed), failed);
+
+  g_free(single_place);
+  g_array_unref(gloc);
+  return updated > 0 ? 0 : 1;
+}
+
 static int32_t _control_move_images_job_run(dt_job_t *job)
 {
   return _generic_dt_control_fileop_images_job_run(job, &dt_image_move,
@@ -2002,6 +2338,21 @@ static dt_control_image_enumerator_t *_control_gpx_apply_alloc()
   return params;
 }
 
+static dt_control_image_enumerator_t *_control_geo_guess_alloc()
+{
+  dt_control_image_enumerator_t *params = _control_image_enumerator_alloc();
+  if(!params) return NULL;
+
+  params->data = calloc(1, sizeof(dt_control_geo_guess_t));
+  if(!params->data)
+  {
+    _control_image_enumerator_cleanup(params);
+    return NULL;
+  }
+
+  return params;
+}
+
 static void _control_gpx_apply_job_cleanup(void *p)
 {
   dt_control_image_enumerator_t *params = p;
@@ -2044,6 +2395,36 @@ static dt_job_t *_control_gpx_apply_job_create(const gchar *filename,
   return job;
 }
 
+static void _control_geo_guess_job_cleanup(void *p)
+{
+  dt_control_image_enumerator_t *params = p;
+
+  dt_control_geo_guess_t *data = params->data;
+  params->data = NULL;
+  g_free(data->command);
+  free(data);
+
+  _control_image_enumerator_cleanup(params);
+}
+
+static dt_job_t *_control_geo_guess_job_create(const gchar *command, GList *imgs)
+{
+  dt_job_t *job = dt_control_job_create(&_control_geo_guess_job_run, "geo guess");
+  if(!job) return NULL;
+  dt_control_image_enumerator_t *params = _control_geo_guess_alloc();
+  if(!params)
+  {
+    dt_control_job_dispose(job);
+    return NULL;
+  }
+
+  dt_control_job_set_params(job, params, _control_geo_guess_job_cleanup);
+  params->index = imgs ? imgs : dt_act_on_get_images(TRUE, TRUE, FALSE);
+  dt_control_geo_guess_t *data = params->data;
+  data->command = g_strdup(command);
+  return job;
+}
+
 void dt_control_merge_hdr()
 {
   dt_control_add_job(DT_JOB_QUEUE_USER_FG,
@@ -2058,6 +2439,11 @@ void dt_control_gpx_apply(const gchar *filename,
                           GList *imgs)
 {
   dt_control_add_job(DT_JOB_QUEUE_USER_FG, _control_gpx_apply_job_create(filename, filmid, tz, imgs));
+}
+
+void dt_control_geo_guess(const gchar *command, GList *imgs)
+{
+  dt_control_add_job(DT_JOB_QUEUE_USER_FG, _control_geo_guess_job_create(command, imgs));
 }
 
 void dt_control_duplicate_images(const gboolean virgin)

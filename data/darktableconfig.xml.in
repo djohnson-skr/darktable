@@ -3778,6 +3778,13 @@
     <shortdescription>camera time zone</shortdescription>
     <longdescription>most cameras don't store the time zone in EXIF. give the correct time zone so the GPX data can be correctly matched</longdescription>
   </dtconfig>
+  <dtconfig ui="yes">
+    <name>plugins/lighttable/geotagging/geo_guesser_command</name>
+    <type>string</type>
+    <default></default>
+    <shortdescription>geo guesser helper command</shortdescription>
+    <longdescription>command used to guess image coordinates from photo content. darktable appends --image PATH --imgid ID and expects a JSON object on stdout containing latitude and longitude. optional fields: elevation, place, confidence, reasoning</longdescription>
+  </dtconfig>
   <dtconfig>
     <name>plugins/map/geotagging_search_url</name>
     <type>string</type>

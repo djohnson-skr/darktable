@@ -29,6 +29,7 @@
 G_BEGIN_DECLS
 
 void dt_control_gpx_apply(const gchar *filename, const int32_t filmid, const gchar *tz, GList *imgs);
+void dt_control_geo_guess(const gchar *command, GList *imgs);
 
 void dt_control_datetime(const GTimeSpan offset, const char *datetime, GList *imgs);
 

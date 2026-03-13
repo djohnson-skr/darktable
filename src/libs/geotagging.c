@@ -17,6 +17,7 @@
 */
 
 #include "common/debug.h"
+#include "common/act_on.h"
 #include "common/file_location.h"
 #include "common/image_cache.h"
 #include "common/collection.h"
@@ -29,6 +30,7 @@
 #include "control/jobs.h"
 #include "gui/accelerators.h"
 #include "gui/gtk.h"
+#include "gui/preferences.h"
 #include "libs/lib_api.h"
 #ifdef HAVE_MAP
 #include "views/view.h"
@@ -91,6 +93,8 @@ typedef struct dt_lib_geotagging_t
   dt_imgid_t imgid;
   GList* imgs;
   int nb_imgs;
+  GtkWidget *geo_guesser_command;
+  GtkWidget *geo_guess_button;
   GtkWidget *apply_offset;
   GtkWidget *lock_offset;
   GtkWidget *apply_datetime;
@@ -127,6 +131,7 @@ typedef struct dt_sel_img_t
 
 static void _datetime_entry_changed(GtkWidget *entry, dt_lib_module_t *self);
 static void _setup_selected_images_list(dt_lib_module_t *self);
+static void _update_geo_guess_button(dt_lib_module_t *self);
 
 static void free_tz_tuple(gpointer data)
 {
@@ -384,6 +389,14 @@ static void _update_buttons(dt_lib_module_t *self)
   gtk_widget_set_sensitive(d->map.apply_gpx_button, d->map.nb_imgs);
   gtk_widget_set_sensitive(d->map.select_button,
                            d->map.nb_imgs && d->map.nb_imgs != d->nb_imgs);
+}
+
+static void _update_geo_guess_button(dt_lib_module_t *self)
+{
+  dt_lib_geotagging_t *d = self->data;
+  const gboolean has_selection = dt_act_on_get_images_nb(TRUE, FALSE) > 0;
+  const gchar *command = gtk_entry_get_text(GTK_ENTRY(d->geo_guesser_command));
+  gtk_widget_set_sensitive(d->geo_guess_button, has_selection && command && *command);
 }
 
 static GList *_get_images_on_active_tracks(dt_lib_module_t *self)
@@ -745,6 +758,21 @@ static void _apply_gpx(GtkWidget *widget, dt_lib_module_t *self)
   }
   g_free(tz);
   gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(d->map.preview_button), FALSE);
+}
+
+static void _geo_guesser_command_changed(GtkEditable *editable, dt_lib_module_t *self)
+{
+  _update_geo_guess_button(self);
+}
+
+static void _guess_geo_location(GtkWidget *widget, dt_lib_module_t *self)
+{
+  gchar *command = dt_conf_get_string("plugins/lighttable/geotagging/geo_guesser_command");
+  if(command && *command)
+    dt_control_geo_guess(command, NULL);
+  else
+    dt_control_log(_("set a geo guesser helper command first"));
+  g_free(command);
 }
 
 static void _update_layout(dt_lib_module_t *self)
@@ -1397,6 +1425,7 @@ static void _refresh_image_datetime(dt_lib_module_t *self)
       _new_datetime(datetime, self);
     }
   }
+  _update_geo_guess_button(self);
 }
 
 static void _image_info_changed(gpointer instance, gpointer imgs, dt_lib_module_t *self)
@@ -1765,7 +1794,10 @@ static void _show_milliseconds(dt_lib_geotagging_t *d)
 
 static void _dt_pref_change_callback(gpointer instance, dt_lib_module_t *self)
 {
-  _show_milliseconds(self->data);
+  dt_lib_geotagging_t *d = self->data;
+  _show_milliseconds(d);
+  dt_gui_preferences_string_update(d->geo_guesser_command);
+  _update_geo_guess_button(self);
 }
 
 void gui_reset(dt_lib_module_t *self)
@@ -1870,6 +1902,23 @@ void gui_init(dt_lib_module_t *self)
   gtk_entry_set_completion(GTK_ENTRY(d->timezone), completion);
   g_signal_connect(G_OBJECT(d->timezone), "key-press-event", G_CALLBACK(_timezone_key_pressed), self);
   g_signal_connect(G_OBJECT(d->timezone), "focus-out-event", G_CALLBACK(_timezone_focus_out), self);
+
+  label = dt_ui_section_label_new(C_("section", "geo guesser"));
+  gtk_grid_attach(grid, label, 0, line++, 4, 1);
+
+  d->geo_guesser_command = dt_gui_preferences_string(grid,
+                                                     "plugins/lighttable/geotagging/geo_guesser_command",
+                                                     0, line++);
+  g_signal_connect(G_OBJECT(d->geo_guesser_command), "changed",
+                   G_CALLBACK(_geo_guesser_command_changed), self);
+
+  d->geo_guess_button = dt_action_button_new(self, N_("guess geo-location"), _guess_geo_location, self,
+                                             _("run the configured geo guesser helper on the selected images.\n"
+                                               "darktable appends --image PATH --imgid ID and expects JSON with latitude and longitude on stdout"),
+                                             0, 0);
+  gtk_widget_set_hexpand(d->geo_guess_button, TRUE);
+  gtk_widget_set_sensitive(d->geo_guess_button, FALSE);
+  gtk_grid_attach(grid, d->geo_guess_button, 0, line++, 4, 1);
 
   // gpx
   d->gpx_button = dt_action_button_new(self, N_("apply GPX track file..."), _choose_gpx_callback, self,
@@ -2018,6 +2067,7 @@ void gui_init(dt_lib_module_t *self)
 #endif
 
   _show_milliseconds(d);
+  _update_geo_guess_button(self);
   gtk_widget_show_all(self->widget);
   gtk_widget_set_no_show_all(self->widget, TRUE);
 }
