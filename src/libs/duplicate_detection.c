@@ -18,6 +18,8 @@
 
 #include "common/collection.h"
 #include "common/darktable.h"
+#include "common/database.h"
+#include "common/debug.h"
 #include "common/image_cache.h"
 #include "common/mipmap_cache.h"
 #include "control/control.h"
