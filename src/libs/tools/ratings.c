@@ -28,6 +28,9 @@
 #include "libs/lib.h"
 #include "libs/lib_api.h"
 
+#include <stdio.h>
+#include <glib/gstdio.h>
+
 DT_MODULE(1)
 
 typedef struct dt_lib_ratings_t
@@ -92,6 +95,9 @@ void gui_init(dt_lib_module_t *self)
   /* initialize ui widgets */
   dt_lib_ratings_t *d = g_malloc0(sizeof(dt_lib_ratings_t));
   self->data = (void *)d;
+  // #region agent log
+  { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"B\",\"location\":\"src/libs/tools/ratings.c:92\",\"message\":\"ratings gui_init entry\",\"data\":{\"self\":\"%p\",\"data\":\"%p\"},\"timestamp\":%lld}\n", (void *)self, (void *)d, (long long)g_get_real_time()); fclose(f); } }
+  // #endregion
 
   self->widget = GTK_WIDGET(gtk_box_new(GTK_ORIENTATION_HORIZONTAL, DT_PIXEL_APPLY_DPI(6)));
   gtk_widget_set_halign(self->widget, GTK_ALIGN_CENTER);
@@ -125,6 +131,9 @@ void gui_init(dt_lib_module_t *self)
   g_signal_connect(G_OBJECT(auto_rate_button), "clicked",
                    G_CALLBACK(_lib_ratings_auto_rate_clicked_callback), self);
   gtk_box_pack_start(GTK_BOX(self->widget), auto_rate_button, FALSE, FALSE, 0);
+  // #region agent log
+  { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"B\",\"location\":\"src/libs/tools/ratings.c:127\",\"message\":\"ratings gui_init button packed\",\"data\":{\"widget\":\"%p\",\"drawing\":\"%p\",\"button\":\"%p\"},\"timestamp\":%lld}\n", (void *)self->widget, (void *)drawing, (void *)auto_rate_button, (long long)g_get_real_time()); fclose(f); } }
+  // #endregion
 
   /* set size of navigation draw area */
   gtk_widget_set_name(self->widget, "lib-rating-stars");
@@ -282,6 +291,9 @@ static void _lib_ratings_start_auto_rate(void)
 {
   GList *imgs = dt_collection_get_all(darktable.collection, -1);
   const guint total = g_list_length(imgs);
+  // #region agent log
+  { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"src/libs/tools/ratings.c:286\",\"message\":\"auto-rate start entered\",\"data\":{\"collection\":\"%p\",\"total\":%u},\"timestamp\":%lld}\n", (void *)darktable.collection, total, (long long)g_get_real_time()); fclose(f); } }
+  // #endregion
 
   if(total == 0)
   {
@@ -314,6 +326,9 @@ static void _lib_ratings_auto_rate_clicked_callback(GtkWidget *widget, dt_lib_mo
 {
   (void)widget;
   (void)self;
+  // #region agent log
+  { FILE *f = g_fopen("/opt/cursor/logs/debug.log", "a"); if(f) { fprintf(f, "{\"hypothesisId\":\"A\",\"location\":\"src/libs/tools/ratings.c:316\",\"message\":\"auto-rate clicked callback\",\"data\":{\"widget\":\"%p\",\"self\":\"%p\"},\"timestamp\":%lld}\n", (void *)widget, (void *)self, (long long)g_get_real_time()); fclose(f); } }
+  // #endregion
   _lib_ratings_start_auto_rate();
 }
 
