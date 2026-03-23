@@ -268,7 +268,7 @@ static gchar *_field_limits_to_string(const dt_introspection_field_t *field)
         for(size_t i = 0; i < field->Enum.entries; i++)
         {
           const char *n = field->Enum.values[i].name;
-          if(!n) continue;
+          if(!n) break;
           if(!first) g_string_append_c(values, ',');
           first = FALSE;
           g_string_append(values, n);
