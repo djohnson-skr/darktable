@@ -96,6 +96,8 @@ static size_t _curl_write_string(void *ptr, size_t size, size_t nmemb, void *use
 {
   GString *response = (GString *)userdata;
   const size_t total = size * nmemb;
+  if(total == 0) return 0;
+  if(!ptr) return 0;
   g_string_append_len(response, (const gchar *)ptr, total);
   return total;
 }
@@ -239,10 +241,17 @@ static gchar *_field_limits_to_string(const dt_introspection_field_t *field)
     case DT_INTROSPECTION_TYPE_ENUM:
     {
       GString *values = g_string_new("values=");
-      for(size_t i = 0; i < field->Enum.entries; i++)
+      if(field->Enum.values)
       {
-        if(i) g_string_append(values, ",");
-        g_string_append(values, field->Enum.values[i].name);
+        gboolean first = TRUE;
+        for(size_t i = 0; i < field->Enum.entries; i++)
+        {
+          const char *n = field->Enum.values[i].name;
+          if(!n) continue;
+          if(!first) g_string_append_c(values, ',');
+          first = FALSE;
+          g_string_append(values, n);
+        }
       }
       return g_string_free(values, FALSE);
     }
@@ -269,11 +278,13 @@ static void _append_module_catalog_for_module(GString *catalog, dt_iop_module_t 
 
   gboolean appended_field = FALSE;
   GString *module_block = g_string_new(NULL);
+  const gchar *op = module->op ? module->op : "";
+  const gchar *label = module->name() ? module->name() : "";
   g_string_append_printf(
     module_block,
     "module %s | label=%s | enabled=%s | aliases=%s | description=%s\n",
-    module->op,
-    module->name(),
+    op,
+    label,
     module->enabled ? "true" : "false",
     aliases ? aliases : "",
     collapsed_description);
@@ -290,12 +301,14 @@ static void _append_module_catalog_for_module(GString *catalog, dt_iop_module_t 
     const gchar *desc = field->header.description && *field->header.description
                       ? field->header.description
                       : field->header.field_name;
+    if(!desc) desc = "";
+    const gchar *type_name = field->header.type_name ? field->header.type_name : "";
 
     g_string_append_printf(
       module_block,
       "  - %s | type=%s | current=%s | default=%s | %s | desc=%s\n",
       field->header.name,
-      field->header.type_name,
+      type_name,
       current,
       defaults,
       limits,
@@ -464,7 +477,9 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   json_builder_set_member_name(builder, "role");
   json_builder_add_string_value(builder, "user");
   json_builder_set_member_name(builder, "content");
-  gchar *content = g_strdup_printf("User request:\n%s\n\nModule catalog:\n%s", prompt, catalog);
+  gchar *content = g_strdup_printf("User request:\n%s\n\nModule catalog:\n%s",
+                                   prompt ? prompt : "",
+                                   catalog ? catalog : "");
   json_builder_add_string_value(builder, content);
   g_free(content);
   json_builder_end_object(builder);
@@ -602,6 +617,7 @@ static gboolean _json_node_to_bool(JsonNode *node, gboolean *value)
     if(type == G_TYPE_STRING)
     {
       const gchar *text = json_node_get_string(node);
+      if(!text) return FALSE;
       if(!g_ascii_strcasecmp(text, "true") || !g_ascii_strcasecmp(text, "yes"))
       {
         *value = TRUE;
@@ -631,12 +647,18 @@ static gboolean _json_node_to_double(JsonNode *node, gdouble *value)
   if(type == G_TYPE_STRING)
   {
     const gchar *text = json_node_get_string(node);
+    if(!text) return FALSE;
     gchar *endptr = NULL;
     const double parsed = g_ascii_strtod(text, &endptr);
-    if(endptr && *g_strstrip(endptr) == '\0')
+    if(endptr)
     {
-      *value = parsed;
-      return TRUE;
+      while(*endptr && g_ascii_isspace((guchar)*endptr))
+        endptr++;
+      if(*endptr == '\0')
+      {
+        *value = parsed;
+        return TRUE;
+      }
     }
   }
 
@@ -763,7 +785,8 @@ static gboolean _set_field_value(dt_iop_module_t *module,
          && json_node_get_value_type(value_node) == G_TYPE_STRING)
       {
         const gchar *text = json_node_get_string(value_node);
-        ok = dt_introspection_get_enum_value((dt_introspection_field_t *)field, text, &enum_value);
+        if(text)
+          ok = dt_introspection_get_enum_value((dt_introspection_field_t *)field, text, &enum_value);
       }
       else
       {
@@ -848,6 +871,11 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
       if(!operation || !json_object_has_member(operation, "module")) continue;
 
       const gchar *module_op = json_object_get_string_member(operation, "module");
+      if(!module_op)
+      {
+        g_string_append(details, "- unable to find module `(missing or non-string name)`\n");
+        continue;
+      }
       dt_iop_module_so_t *module_so = dt_iop_get_module_so(module_op);
       dt_iop_module_t *module = module_so ? dt_iop_get_module_preferred_instance(module_so)
                                           : dt_iop_get_module(module_op);
@@ -878,7 +906,9 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
         }
       }
 
-      g_string_append_printf(details, "- %s (%s)\n", module->name(), module->op);
+      g_string_append_printf(details, "- %s (%s)\n",
+                             module->name() ? module->name() : "",
+                             module->op ? module->op : "");
 
       GPtrArray *changes = g_ptr_array_new_with_free_func(_free_field_change);
       if(json_object_has_member(operation, "fields"))
@@ -893,6 +923,11 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
             continue;
 
           const gchar *field_name = json_object_get_string_member(field_object, "name");
+          if(!field_name)
+          {
+            g_string_append(details, "    skipped field with missing or non-string name\n");
+            continue;
+          }
           dt_introspection_field_t *field = module->get_f ? module->get_f(field_name) : NULL;
           if(!_field_is_supported(field))
           {
@@ -944,7 +979,10 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
     {
       g_string_append(details, "\nwarnings:\n");
       for(guint i = 0; i < json_array_get_length(warnings); i++)
-        g_string_append_printf(details, "- %s\n", json_array_get_string_element(warnings, i));
+      {
+        const gchar *w = json_array_get_string_element(warnings, i);
+        g_string_append_printf(details, "- %s\n", w ? w : _("(non-string entry)"));
+      }
     }
   }
 
@@ -955,7 +993,10 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
     {
       g_string_append(details, "\nnot handled:\n");
       for(guint i = 0; i < json_array_get_length(unhandled); i++)
-        g_string_append_printf(details, "- %s\n", json_array_get_string_element(unhandled, i));
+      {
+        const gchar *u = json_array_get_string_element(unhandled, i);
+        g_string_append_printf(details, "- %s\n", u ? u : _("(non-string entry)"));
+      }
     }
   }
 
