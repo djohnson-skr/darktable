@@ -85,6 +85,9 @@ typedef struct dt_lib_photo_assistant_t
   guint request_id;
 } dt_lib_photo_assistant_t;
 
+static gboolean _json_node_to_bool(JsonNode *node, gboolean *value);
+static gboolean _json_node_to_double(JsonNode *node, gdouble *value);
+
 static size_t _curl_write_string(void *ptr, size_t size, size_t nmemb, void *userdata)
 {
   GString *response = (GString *)userdata;
@@ -368,29 +371,36 @@ static gboolean _save_api_key(const gchar *api_key)
   return ok;
 }
 
-static gchar *_extract_json_content(const gchar *content)
+static gchar *_json_node_dup_string(JsonNode *node)
 {
-  if(!content) return NULL;
+  if(!node || !JSON_NODE_HOLDS_VALUE(node)) return NULL;
 
-  gchar *trimmed = g_strdup(content);
-  g_strstrip(trimmed);
-
-  if(g_str_has_prefix(trimmed, "```"))
+  const GType type = json_node_get_value_type(node);
+  if(type == G_TYPE_STRING)
   {
-    gchar *start = strchr(trimmed, '\n');
-    gchar *end = g_strrstr(trimmed, "```");
-    if(start && end && end > start)
-    {
-      start++;
-      *end = '\0';
-      gchar *stripped = g_strdup(start);
-      g_free(trimmed);
-      g_strstrip(stripped);
-      return stripped;
-    }
+    const gchar *text = json_node_get_string(node);
+    return text ? g_strdup(text) : NULL;
   }
+  if(type == G_TYPE_BOOLEAN)
+    return g_strdup(json_node_get_boolean(node) ? "true" : "false");
+  if(type == G_TYPE_INT64 || type == G_TYPE_DOUBLE)
+    return g_strdup_printf("%.10g", json_node_get_double(node));
 
-  return trimmed;
+  return NULL;
+}
+
+static gchar *_json_node_to_compact_data(JsonNode *node)
+{
+  if(!node) return NULL;
+
+  JsonGenerator *generator = json_generator_new();
+  json_generator_set_root(generator, node);
+#if JSON_CHECK_VERSION(0, 14, 0)
+  json_generator_set_pretty(generator, FALSE);
+#endif
+  gchar *data = json_generator_to_data(generator, NULL);
+  g_object_unref(generator);
+  return data;
 }
 
 static gchar *_extract_openai_error(const gchar *payload)
@@ -421,14 +431,170 @@ static gchar *_extract_openai_error(const gchar *payload)
   return message;
 }
 
-static gchar *_call_openai_chat_completions(const gchar *api_key,
-                                            const gchar *model,
-                                            const gchar *catalog,
-                                            const gchar *prompt,
-                                            gchar **error_message)
+static void _append_tool_schema_set_module_fields(JsonBuilder *builder)
 {
-  if(error_message) *error_message = NULL;
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "function");
+  json_builder_set_member_name(builder, "function");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "name");
+  json_builder_add_string_value(builder, "set_module_fields");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(
+    builder,
+    "Apply darktable module changes by op name and field list. "
+    "Use only module ops and field names present in the catalog.");
+  json_builder_set_member_name(builder, "parameters");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "object");
+  json_builder_set_member_name(builder, "properties");
+  json_builder_begin_object(builder);
 
+  json_builder_set_member_name(builder, "module");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "darktable module op, for example vignette or hazeremoval");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "enable");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "boolean");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "whether the module should be enabled");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "focus");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "boolean");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "whether the module should receive darkroom focus after the edit");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "reason");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "brief reason for this module change");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "fields");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "array");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "field updates for this module");
+  json_builder_set_member_name(builder, "items");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "object");
+  json_builder_set_member_name(builder, "properties");
+  json_builder_begin_object(builder);
+
+  json_builder_set_member_name(builder, "name");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "value");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "absolute final value for the field");
+  json_builder_end_object(builder);
+
+  json_builder_end_object(builder);
+  json_builder_set_member_name(builder, "required");
+  json_builder_begin_array(builder);
+  json_builder_add_string_value(builder, "name");
+  json_builder_add_string_value(builder, "value");
+  json_builder_end_array(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "required");
+  json_builder_begin_array(builder);
+  json_builder_add_string_value(builder, "module");
+  json_builder_add_string_value(builder, "fields");
+  json_builder_end_array(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+}
+
+static void _append_tool_schema_finish_edit_plan(JsonBuilder *builder)
+{
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "function");
+  json_builder_set_member_name(builder, "function");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "name");
+  json_builder_add_string_value(builder, "finish_edit_plan");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(
+    builder,
+    "Finish the assistant run after all needed set_module_fields calls have been made.");
+  json_builder_set_member_name(builder, "parameters");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "object");
+  json_builder_set_member_name(builder, "properties");
+  json_builder_begin_object(builder);
+
+  json_builder_set_member_name(builder, "summary");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_set_member_name(builder, "description");
+  json_builder_add_string_value(builder, "user-facing summary of the applied edits");
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "warnings");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "array");
+  json_builder_set_member_name(builder, "items");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+
+  json_builder_set_member_name(builder, "unhandled");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "array");
+  json_builder_set_member_name(builder, "items");
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "type");
+  json_builder_add_string_value(builder, "string");
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+
+  json_builder_end_object(builder);
+  json_builder_set_member_name(builder, "required");
+  json_builder_begin_array(builder);
+  json_builder_add_string_value(builder, "summary");
+  json_builder_end_array(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+  json_builder_end_object(builder);
+}
+
+static gchar *_build_openai_tool_request_body(const gchar *model,
+                                              const gchar *catalog,
+                                              const gchar *prompt)
+{
   JsonBuilder *builder = json_builder_new();
   json_builder_begin_object(builder);
 
@@ -438,11 +604,8 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   json_builder_set_member_name(builder, "temperature");
   json_builder_add_double_value(builder, 0.2);
 
-  json_builder_set_member_name(builder, "response_format");
-  json_builder_begin_object(builder);
-  json_builder_set_member_name(builder, "type");
-  json_builder_add_string_value(builder, "json_object");
-  json_builder_end_object(builder);
+  json_builder_set_member_name(builder, "tool_choice");
+  json_builder_add_string_value(builder, "auto");
 
   json_builder_set_member_name(builder, "messages");
   json_builder_begin_array(builder);
@@ -453,17 +616,12 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   json_builder_set_member_name(builder, "content");
   json_builder_add_string_value(
     builder,
-    "You are a darktable darkroom editing planner. "
-    "Turn the user's natural-language request into a JSON object with this exact shape: "
-    "{\"summary\":\"...\",\"operations\":[{\"module\":\"module_op\",\"enable\":true,\"focus\":false,"
-    "\"fields\":[{\"name\":\"field_name\",\"value\":0.0}],\"reason\":\"...\"}],"
-    "\"warnings\":[\"...\"],\"unhandled\":[\"...\"]}. "
-    "Only use module ops and field names that appear in the provided catalog. "
-    "Choose the smallest set of modules needed. "
-    "Use absolute final values that already incorporate the current values from the catalog. "
-    "Do not invent modules, fields, or enum values. "
-    "If a request is partially unsupported, still produce the supported edits and explain the rest in `unhandled`. "
-    "Negative haze-removal strength adds haze, and lower `colorbalancergb.shadows_Y` darkens shadows.");
+    "You are a darktable darkroom editing assistant. "
+    "Use the provided tools to make actual module-linked edit decisions. "
+    "Call set_module_fields once per module you want to change, using only module ops and field names present in the catalog. "
+    "Use absolute final values, not deltas. "
+    "When done, call finish_edit_plan exactly once with a concise summary plus any warnings or unhandled requests. "
+    "Negative hazeremoval.strength adds haze, and lower colorbalancergb.shadows_Y darkens shadows.");
   json_builder_end_object(builder);
 
   json_builder_begin_object(builder);
@@ -478,20 +636,319 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   json_builder_end_object(builder);
 
   json_builder_end_array(builder);
+
+  json_builder_set_member_name(builder, "tools");
+  json_builder_begin_array(builder);
+  _append_tool_schema_set_module_fields(builder);
+  _append_tool_schema_finish_edit_plan(builder);
+  json_builder_end_array(builder);
+
   json_builder_end_object(builder);
 
   JsonGenerator *generator = json_generator_new();
-  JsonNode *request_root = json_builder_get_root(builder);
-  json_generator_set_root(generator, request_root);
-  gchar *request_body = json_generator_to_data(generator, NULL);
+  JsonNode *root = json_builder_get_root(builder);
+  json_generator_set_root(generator, root);
+#if JSON_CHECK_VERSION(0, 14, 0)
+  json_generator_set_pretty(generator, FALSE);
+#endif
+  gchar *data = json_generator_to_data(generator, NULL);
+  json_node_free(root);
+  g_object_unref(generator);
+  g_object_unref(builder);
+  return data;
+}
+
+static gchar *_tool_arguments_to_operation_json(const gchar *arguments)
+{
+  JsonParser *parser = json_parser_new();
+  if(!json_parser_load_from_data(parser, arguments ? arguments : "{}", -1, NULL))
+  {
+    g_object_unref(parser);
+    return NULL;
+  }
+
+  JsonNode *root = json_parser_get_root(parser);
+  if(!root || !JSON_NODE_HOLDS_OBJECT(root))
+  {
+    g_object_unref(parser);
+    return NULL;
+  }
+
+  JsonObject *object = json_node_get_object(root);
+  JsonBuilder *builder = json_builder_new();
+  json_builder_begin_object(builder);
+
+  if(json_object_has_member(object, "module"))
+  {
+    JsonNode *node = json_object_get_member(object, "module");
+    gchar *value = _json_node_dup_string(node);
+    if(value)
+    {
+      json_builder_set_member_name(builder, "module");
+      json_builder_add_string_value(builder, value);
+      g_free(value);
+    }
+  }
+
+  if(json_object_has_member(object, "enable"))
+  {
+    gboolean enable = TRUE;
+    if(_json_node_to_bool(json_object_get_member(object, "enable"), &enable))
+    {
+      json_builder_set_member_name(builder, "enable");
+      json_builder_add_boolean_value(builder, enable);
+    }
+  }
+  else
+  {
+    json_builder_set_member_name(builder, "enable");
+    json_builder_add_boolean_value(builder, TRUE);
+  }
+
+  if(json_object_has_member(object, "focus"))
+  {
+    gboolean focus = FALSE;
+    if(_json_node_to_bool(json_object_get_member(object, "focus"), &focus))
+    {
+      json_builder_set_member_name(builder, "focus");
+      json_builder_add_boolean_value(builder, focus);
+    }
+  }
+
+  if(json_object_has_member(object, "reason"))
+  {
+    gchar *reason = _json_node_dup_string(json_object_get_member(object, "reason"));
+    if(reason)
+    {
+      json_builder_set_member_name(builder, "reason");
+      json_builder_add_string_value(builder, reason);
+      g_free(reason);
+    }
+  }
+
+  if(json_object_has_member(object, "fields"))
+  {
+    JsonNode *fields_node = json_object_get_member(object, "fields");
+    if(fields_node && JSON_NODE_HOLDS_ARRAY(fields_node))
+    {
+      json_builder_set_member_name(builder, "fields");
+      json_builder_begin_array(builder);
+      JsonArray *fields = json_node_get_array(fields_node);
+      const guint len = json_array_get_length(fields);
+      for(guint i = 0; i < len; i++)
+      {
+        JsonNode *field_node = json_array_get_element(fields, i);
+        if(!field_node || !JSON_NODE_HOLDS_OBJECT(field_node)) continue;
+
+        JsonObject *field = json_node_get_object(field_node);
+        json_builder_begin_object(builder);
+
+        if(json_object_has_member(field, "name"))
+        {
+          gchar *name = _json_node_dup_string(json_object_get_member(field, "name"));
+          if(name)
+          {
+            json_builder_set_member_name(builder, "name");
+            json_builder_add_string_value(builder, name);
+            g_free(name);
+          }
+        }
+
+        if(json_object_has_member(field, "value"))
+        {
+          JsonNode *value_node = json_object_get_member(field, "value");
+          gchar *value_data = _json_node_to_compact_data(value_node);
+          if(value_data)
+          {
+            JsonParser *value_parser = json_parser_new();
+            if(json_parser_load_from_data(value_parser, value_data, -1, NULL))
+            {
+              JsonNode *value_root = json_parser_get_root(value_parser);
+              if(value_root)
+              {
+                json_builder_set_member_name(builder, "value");
+                json_builder_add_value(builder, json_node_copy(value_root));
+              }
+            }
+            g_object_unref(value_parser);
+            g_free(value_data);
+          }
+        }
+
+        json_builder_end_object(builder);
+      }
+      json_builder_end_array(builder);
+    }
+  }
+
+  json_builder_end_object(builder);
+  JsonGenerator *generator = json_generator_new();
+  JsonNode *out_root = json_builder_get_root(builder);
+  json_generator_set_root(generator, out_root);
+  gchar *data = json_generator_to_data(generator, NULL);
+  json_node_free(out_root);
+  g_object_unref(generator);
+  g_object_unref(builder);
+  g_object_unref(parser);
+  return data;
+}
+
+static gchar *_build_plan_json_from_tool_calls(JsonArray *tool_calls,
+                                               gchar **error_message)
+{
+  if(error_message) *error_message = NULL;
+
+  JsonBuilder *builder = json_builder_new();
+  json_builder_begin_object(builder);
+  json_builder_set_member_name(builder, "operations");
+  json_builder_begin_array(builder);
+
+  gchar *summary = NULL;
+  GPtrArray *warnings = g_ptr_array_new_with_free_func(g_free);
+  GPtrArray *unhandled = g_ptr_array_new_with_free_func(g_free);
+  gboolean saw_finish = FALSE;
+
+  const guint len = json_array_get_length(tool_calls);
+  for(guint i = 0; i < len; i++)
+  {
+    JsonObject *call = json_array_get_object_element(tool_calls, i);
+    if(!call || !json_object_has_member(call, "type")) continue;
+    const gchar *type = json_object_get_string_member(call, "type");
+    if(!type || g_strcmp0(type, "function")) continue;
+    if(!json_object_has_member(call, "function")) continue;
+
+    JsonObject *function = json_object_get_object_member(call, "function");
+    if(!function || !json_object_has_member(function, "name")) continue;
+
+    const gchar *name = json_object_get_string_member(function, "name");
+    const gchar *arguments = json_object_has_member(function, "arguments")
+                           ? json_object_get_string_member(function, "arguments")
+                           : "{}";
+
+    if(g_strcmp0(name, "set_module_fields") == 0)
+    {
+      gchar *operation_json = _tool_arguments_to_operation_json(arguments);
+      if(!operation_json) continue;
+
+      JsonParser *operation_parser = json_parser_new();
+      if(json_parser_load_from_data(operation_parser, operation_json, -1, NULL))
+      {
+        JsonNode *operation_root = json_parser_get_root(operation_parser);
+        if(operation_root && JSON_NODE_HOLDS_OBJECT(operation_root))
+          json_builder_add_value(builder, json_node_copy(operation_root));
+      }
+      g_object_unref(operation_parser);
+      g_free(operation_json);
+    }
+    else if(g_strcmp0(name, "finish_edit_plan") == 0)
+    {
+      JsonParser *finish_parser = json_parser_new();
+      if(json_parser_load_from_data(finish_parser, arguments ? arguments : "{}", -1, NULL))
+      {
+        JsonNode *finish_root = json_parser_get_root(finish_parser);
+        if(finish_root && JSON_NODE_HOLDS_OBJECT(finish_root))
+        {
+          JsonObject *finish = json_node_get_object(finish_root);
+          saw_finish = TRUE;
+
+          if(json_object_has_member(finish, "summary"))
+          {
+            g_free(summary);
+            summary = _json_node_dup_string(json_object_get_member(finish, "summary"));
+          }
+
+          if(json_object_has_member(finish, "warnings"))
+          {
+            JsonNode *warnings_node = json_object_get_member(finish, "warnings");
+            if(warnings_node && JSON_NODE_HOLDS_ARRAY(warnings_node))
+            {
+              JsonArray *array = json_node_get_array(warnings_node);
+              for(guint j = 0; j < json_array_get_length(array); j++)
+              {
+                gchar *entry = _json_node_dup_string(json_array_get_element(array, j));
+                if(entry) g_ptr_array_add(warnings, entry);
+              }
+            }
+          }
+
+          if(json_object_has_member(finish, "unhandled"))
+          {
+            JsonNode *unhandled_node = json_object_get_member(finish, "unhandled");
+            if(unhandled_node && JSON_NODE_HOLDS_ARRAY(unhandled_node))
+            {
+              JsonArray *array = json_node_get_array(unhandled_node);
+              for(guint j = 0; j < json_array_get_length(array); j++)
+              {
+                gchar *entry = _json_node_dup_string(json_array_get_element(array, j));
+                if(entry) g_ptr_array_add(unhandled, entry);
+              }
+            }
+          }
+        }
+      }
+      g_object_unref(finish_parser);
+    }
+  }
+
+  json_builder_end_array(builder);
+
+  json_builder_set_member_name(builder, "summary");
+  json_builder_add_string_value(builder, summary ? summary : _("applied assistant edits"));
+
+  if(warnings->len > 0)
+  {
+    json_builder_set_member_name(builder, "warnings");
+    json_builder_begin_array(builder);
+    for(guint i = 0; i < warnings->len; i++)
+      json_builder_add_string_value(builder, g_ptr_array_index(warnings, i));
+    json_builder_end_array(builder);
+  }
+
+  if(unhandled->len > 0)
+  {
+    json_builder_set_member_name(builder, "unhandled");
+    json_builder_begin_array(builder);
+    for(guint i = 0; i < unhandled->len; i++)
+      json_builder_add_string_value(builder, g_ptr_array_index(unhandled, i));
+    json_builder_end_array(builder);
+  }
+
+  json_builder_end_object(builder);
+
+  if(!saw_finish && error_message)
+    *error_message = g_strdup(_("assistant did not finish the edit plan"));
+
+  JsonGenerator *generator = json_generator_new();
+  JsonNode *root = json_builder_get_root(builder);
+  json_generator_set_root(generator, root);
+  gchar *data = json_generator_to_data(generator, NULL);
+  json_node_free(root);
+  g_object_unref(generator);
+  g_object_unref(builder);
+  g_ptr_array_free(warnings, TRUE);
+  g_ptr_array_free(unhandled, TRUE);
+  g_free(summary);
+  return data;
+}
+
+static gchar *_call_openai_chat_completions(const gchar *api_key,
+                                            const gchar *model,
+                                            const gchar *catalog,
+                                            const gchar *prompt,
+                                            gchar **error_message)
+{
+  if(error_message) *error_message = NULL;
+  gchar *request_body = _build_openai_tool_request_body(model, catalog, prompt);
+  if(!request_body)
+  {
+    if(error_message) *error_message = g_strdup(_("unable to build OpenAI tool request"));
+    return NULL;
+  }
 
   CURL *curl = curl_easy_init();
   if(!curl)
   {
     if(error_message) *error_message = g_strdup(_("unable to initialize network client"));
-    json_node_free(request_root);
-    g_object_unref(generator);
-    g_object_unref(builder);
     g_free(request_body);
     return NULL;
   }
@@ -520,9 +977,6 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   curl_slist_free_all(headers);
   curl_easy_cleanup(curl);
   g_free(auth);
-  json_node_free(request_root);
-  g_object_unref(generator);
-  g_object_unref(builder);
   g_free(request_body);
 
   if(res != CURLE_OK || http_code != 200)
@@ -580,6 +1034,7 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
     return NULL;
   }
 
+  JsonArray *tool_calls = NULL;
   JsonObject *choice = json_array_get_object_element(choices, 0);
   if(!choice || !json_object_has_member(choice, "message"))
   {
@@ -590,27 +1045,33 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   }
 
   JsonObject *message = json_object_get_object_member(choice, "message");
-  if(!message || !json_object_has_member(message, "content"))
+  if(!message || !json_object_has_member(message, "tool_calls"))
   {
-    if(error_message) *error_message = g_strdup(_("OpenAI response message did not contain content"));
+    if(error_message) *error_message = g_strdup(_("OpenAI response message did not contain any tool calls"));
     g_object_unref(parser);
     g_string_free(response, TRUE);
     return NULL;
   }
 
-  const gchar *raw_content = json_object_get_string_member(message, "content");
-  if(!raw_content)
-  {
-    if(error_message) *error_message = g_strdup(_("OpenAI response content was missing or not a string"));
-    g_object_unref(parser);
-    g_string_free(response, TRUE);
-    return NULL;
-  }
+  tool_calls = json_object_get_array_member(message, "tool_calls");
 
-  gchar *result = _extract_json_content(raw_content);
+  gchar *tool_error = NULL;
+  gchar *result = NULL;
+  if(tool_calls && json_array_get_length(tool_calls) > 0)
+  {
+    result = _build_plan_json_from_tool_calls(tool_calls, &tool_error);
+  }
+  else
+  {
+    if(error_message) *error_message = g_strdup(_("OpenAI response did not contain any tool calls"));
+  }
 
   g_object_unref(parser);
   g_string_free(response, TRUE);
+  if(!result && error_message && !*error_message && tool_error)
+    *error_message = tool_error;
+  else
+    g_free(tool_error);
   return result;
 }
 
