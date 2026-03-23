@@ -237,7 +237,15 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
     return FALSE;
   }
 
-  JsonArray *actions = json_object_get_array_member(obj, "actions");
+  JsonNode *actions_node = json_object_get_member(obj, "actions");
+  if(!actions_node || !JSON_NODE_HOLDS_ARRAY(actions_node))
+  {
+    g_string_append(log, _("No \"actions\" array in assistant reply.\n"));
+    g_object_unref(parser);
+    return FALSE;
+  }
+
+  JsonArray *actions = json_node_get_array(actions_node);
   const guint n = json_array_get_length(actions);
   gboolean any = FALSE;
 
@@ -288,7 +296,6 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
         continue;
       }
       dt_iop_load_default_params(mod);
-      memcpy(mod->params, mod->default_params, mod->params_size);
       dt_dev_add_history_item(darktable.develop, mod, mod->enabled);
       g_string_append_printf(log, _("Reset parameters for `%s`\n"), op);
       any = TRUE;
@@ -471,7 +478,7 @@ static char *_openai_chat_sync(const char *api_key,
     if(json_object_has_member(o, "error"))
     {
       JsonObject *eo = json_object_get_object_member(o, "error");
-      const gchar *em = json_object_get_string_member(eo, "message");
+      const gchar *em = eo ? json_object_get_string_member(eo, "message") : NULL;
       g_string_append_printf(err_out, _("API error: %s\n"), em ? em : "?");
     }
     else if(json_object_has_member(o, "choices"))
