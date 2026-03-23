@@ -46,13 +46,6 @@ DT_MODULE(1)
 #define DT_PHOTO_ASSISTANT_DEFAULT_MODEL "gpt-4.1-mini"
 #define DT_PHOTO_ASSISTANT_REQUEST_TIMEOUT 90L
 
-typedef struct dt_photo_assistant_field_change_t
-{
-  gchar *name;
-  gchar *before;
-  gchar *after;
-} dt_photo_assistant_field_change_t;
-
 typedef struct dt_photo_assistant_apply_result_t
 {
   gchar *summary;
@@ -692,7 +685,6 @@ static gboolean _json_node_to_double(JsonNode *node, gdouble *value)
 static gboolean _set_field_value(dt_iop_module_t *module,
                                  const dt_introspection_field_t *field,
                                  JsonNode *value_node,
-                                 GPtrArray *changes,
                                  GString *details)
 {
   if(!module || !field || !value_node) return FALSE;
@@ -834,27 +826,14 @@ static gboolean _set_field_value(dt_iop_module_t *module,
   if(changed)
   {
     gchar *after = _field_value_to_string(field, module->params);
-    dt_photo_assistant_field_change_t *change = g_new0(dt_photo_assistant_field_change_t, 1);
-    change->name = g_strdup(field->header.name);
-    change->before = before;
-    change->after = g_strdup(after);
-    g_ptr_array_add(changes, change);
     g_string_append_printf(details, "    %s: %s -> %s\n", field->header.name, before, after);
     g_free(after);
+    g_free(before);
     return TRUE;
   }
 
   g_free(before);
   return FALSE;
-}
-
-static void _free_field_change(gpointer data)
-{
-  dt_photo_assistant_field_change_t *change = (dt_photo_assistant_field_change_t *)data;
-  g_free(change->name);
-  g_free(change->before);
-  g_free(change->after);
-  g_free(change);
 }
 
 static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_json, gchar **error_message)
@@ -925,7 +904,12 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
         if(!module->hide_enable_button || requested_enable)
         {
           module->enabled = requested_enable;
-          if(module->off) dt_iop_gui_set_enable_button(module);
+          if(module->off)
+          {
+            ++darktable.gui->reset;
+            dt_iop_gui_set_enable_button(module);
+            --darktable.gui->reset;
+          }
           changed = TRUE;
         }
       }
@@ -934,7 +918,6 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
                              module->name() ? module->name() : "",
                              module->op);
 
-      GPtrArray *changes = g_ptr_array_new_with_free_func(_free_field_change);
       if(json_object_has_member(operation, "fields"))
       {
         JsonArray *fields = json_object_get_array_member(operation, "fields");
@@ -960,7 +943,7 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
           }
 
           JsonNode *value_node = json_object_get_member(field_object, "value");
-          if(_set_field_value(module, field, value_node, changes, details))
+          if(_set_field_value(module, field, value_node, details))
             changed = TRUE;
         }
       }
@@ -981,8 +964,6 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
       {
         g_string_append(details, "    no effective change\n");
       }
-
-      g_ptr_array_free(changes, TRUE);
 
       if(json_object_has_member(operation, "focus"))
       {
