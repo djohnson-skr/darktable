@@ -36,9 +36,30 @@
 #include <json-glib/json-glib.h>
 #include <gtk/gtk.h>
 #include <math.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <string.h>
 
 DT_MODULE(1)
+
+// #region photo_assistant phase trace (remove after debugging)
+#define DT_PHOTO_ASSISTANT_TRACE_PATH "/tmp/darktable_photo_assistant_trace.log"
+
+G_GNUC_PRINTF(1, 2)
+static void _pa_trace(const char *fmt, ...)
+{
+  FILE *f = g_fopen(DT_PHOTO_ASSISTANT_TRACE_PATH, "a");
+  if(!f) return;
+  fprintf(f, "%" G_GINT64_FORMAT " ", (gint64)g_get_monotonic_time());
+  va_list ap;
+  va_start(ap, fmt);
+  vfprintf(f, fmt, ap);
+  va_end(ap);
+  fputc('\n', f);
+  fflush(f);
+  fclose(f);
+}
+// #endregion
 
 #define DT_PHOTO_ASSISTANT_MODEL_KEY "plugins/darkroom/photo_assistant/model"
 #define DT_PHOTO_ASSISTANT_SECRET_SLOT "photo_assistant_openai"
@@ -278,7 +299,7 @@ static void _append_module_catalog_for_module(GString *catalog, dt_iop_module_t 
 
   gboolean appended_field = FALSE;
   GString *module_block = g_string_new(NULL);
-  const gchar *op = module->op ? module->op : "";
+  const gchar *op = module->op;
   const gchar *label = module->name() ? module->name() : "";
   g_string_append_printf(
     module_block,
@@ -534,6 +555,7 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
 
   if(res != CURLE_OK || http_code != 200)
   {
+    _pa_trace("openai_request_failed curl=%d http=%ld", (int)res, http_code);
     gchar *api_error = _extract_openai_error(response->str);
     if(error_message)
     {
@@ -551,9 +573,12 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
     return NULL;
   }
 
+  _pa_trace("openai_request_complete http=%ld response_len=%zu", http_code, response->len);
+
   JsonParser *parser = json_parser_new();
   if(!json_parser_load_from_data(parser, response->str, response->len, NULL))
   {
+    _pa_trace("openai_response_parse_failed");
     if(error_message) *error_message = g_strdup(_("unable to parse OpenAI response"));
     g_object_unref(parser);
     g_string_free(response, TRUE);
@@ -591,6 +616,8 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   JsonObject *message = json_object_get_object_member(choice, "message");
   const gchar *raw_content = json_object_get_string_member(message, "content");
   gchar *result = _extract_json_content(raw_content);
+
+  _pa_trace("openai_response_parsed plan_json_len=%zu", result ? strlen(result) : (size_t)0);
 
   g_object_unref(parser);
   g_string_free(response, TRUE);
@@ -837,9 +864,12 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
 {
   if(error_message) *error_message = NULL;
 
+  _pa_trace("apply_plan_json_entered plan_len=%zu", plan_json ? strlen(plan_json) : (size_t)0);
+
   JsonParser *parser = json_parser_new();
   if(!json_parser_load_from_data(parser, plan_json, -1, NULL))
   {
+    _pa_trace("apply_plan_json_exit invalid_json");
     if(error_message) *error_message = g_strdup(_("assistant response was not valid JSON"));
     g_object_unref(parser);
     return NULL;
@@ -848,6 +878,7 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
   JsonNode *root = json_parser_get_root(parser);
   if(!root || !JSON_NODE_HOLDS_OBJECT(root))
   {
+    _pa_trace("apply_plan_json_exit not_object");
     if(error_message) *error_message = g_strdup(_("assistant response was not a JSON object"));
     g_object_unref(parser);
     return NULL;
@@ -887,6 +918,8 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
         continue;
       }
 
+      _pa_trace("apply_operation i=%u op=%s", i, module_op);
+
       const gboolean had_history = dt_dev_get_history_item(darktable.develop, module->op) != NULL;
       gboolean requested_enable = TRUE;
       if(json_object_has_member(operation, "enable"))
@@ -908,7 +941,7 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
 
       g_string_append_printf(details, "- %s (%s)\n",
                              module->name() ? module->name() : "",
-                             module->op ? module->op : "");
+                             module->op);
 
       GPtrArray *changes = g_ptr_array_new_with_free_func(_free_field_change);
       if(json_object_has_member(operation, "fields"))
@@ -969,8 +1002,14 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
     }
   }
 
+  _pa_trace("apply_plan_json_after_operations_loop");
+
   if(focus_module)
+  {
+    _pa_trace("apply_plan_json_before_request_focus");
     dt_iop_request_focus(focus_module);
+    _pa_trace("apply_plan_json_after_request_focus");
+  }
 
   if(json_object_has_member(object, "warnings"))
   {
@@ -1006,6 +1045,8 @@ static dt_photo_assistant_apply_result_t *_apply_plan_json(const gchar *plan_jso
                   : g_strdup(_("applied assistant edits"));
   result->details = g_string_free(details, FALSE);
   result->operations_applied = applied;
+
+  _pa_trace("apply_plan_json_exit ok operations_applied=%d", applied);
 
   g_object_unref(parser);
   return result;
@@ -1043,8 +1084,11 @@ static gboolean _request_finished(gpointer user_data)
   dt_lib_module_t *self = result->self;
   dt_lib_photo_assistant_t *d = self->data;
 
+  _pa_trace("request_finished_enter request_id=%u success=%d", result->request_id, result->success ? 1 : 0);
+
   if(result->request_id != d->request_id)
   {
+    _pa_trace("request_finished_exit stale_request_id");
     _free_result(result);
     return G_SOURCE_REMOVE;
   }
@@ -1054,6 +1098,7 @@ static gboolean _request_finished(gpointer user_data)
 
   if(!result->success)
   {
+    _pa_trace("request_finished_exit openai_or_network_error");
     _set_text_buffer(GTK_TEXT_VIEW(d->response_view), result->status);
     dt_control_log("%s", result->status);
     _free_result(result);
@@ -1064,6 +1109,7 @@ static gboolean _request_finished(gpointer user_data)
   dt_photo_assistant_apply_result_t *apply = _apply_plan_json(result->plan_json, &apply_error);
   if(!apply)
   {
+    _pa_trace("request_finished_exit apply_failed");
     _set_text_buffer(GTK_TEXT_VIEW(d->response_view), apply_error ? apply_error : result->plan_json);
     _set_status(d, apply_error ? apply_error : _("unable to apply assistant edits"));
     if(apply_error) dt_control_log("%s", apply_error);
@@ -1090,12 +1136,14 @@ static gboolean _request_finished(gpointer user_data)
 
   _free_apply_result(apply);
   _free_result(result);
+  _pa_trace("request_finished_exit success");
   return G_SOURCE_REMOVE;
 }
 
 static gpointer _photo_assistant_thread(gpointer user_data)
 {
   dt_photo_assistant_request_t *request = (dt_photo_assistant_request_t *)user_data;
+  _pa_trace("worker_thread_started request_id=%u", request->request_id);
   dt_photo_assistant_result_t *result = g_new0(dt_photo_assistant_result_t, 1);
   result->self = request->self;
   result->request_id = request->request_id;
@@ -1109,7 +1157,9 @@ static gpointer _photo_assistant_thread(gpointer user_data)
   if(result->success && !result->status)
     result->status = g_strdup(_("assistant plan ready"));
 
+  _pa_trace("worker_thread_openai_done request_id=%u success=%d", request->request_id, result->success ? 1 : 0);
   g_main_context_invoke(NULL, _request_finished, result);
+  _pa_trace("worker_thread_invoke_scheduled request_id=%u", request->request_id);
   _free_request(request);
   return NULL;
 }
@@ -1137,6 +1187,8 @@ static void _send_clicked(GtkButton *button, gpointer user_data)
   dt_lib_module_t *self = (dt_lib_module_t *)user_data;
   dt_lib_photo_assistant_t *d = self->data;
   if(d->busy) return;
+
+  _pa_trace("send_clicked");
 
   gchar *prompt = _dup_text_buffer(GTK_TEXT_VIEW(d->prompt_view));
   g_strstrip(prompt);
@@ -1172,11 +1224,15 @@ static void _send_clicked(GtkButton *button, gpointer user_data)
   request->api_key = g_strdup(api_key);
   request->model = g_strdup(model);
   request->catalog = _build_module_catalog();
+  _pa_trace("catalog_built request_id=%u catalog_len=%zu",
+            request->request_id,
+            request->catalog ? strlen(request->catalog) : (size_t)0);
 
   _set_busy(d, TRUE);
   _set_status(d, _("asking OpenAI for an edit plan..."));
   _set_text_buffer(GTK_TEXT_VIEW(d->response_view), _("Working..."));
 
+  _pa_trace("worker_thread_spawning request_id=%u", request->request_id);
   g_thread_new("photo-assistant", _photo_assistant_thread, request);
 }
 
