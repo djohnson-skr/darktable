@@ -46,17 +46,30 @@ typedef struct dt_lib_photo_assistant_t
   GtkWidget *model_combo;
   GtkWidget *send_btn;
   volatile gboolean busy;
+  guint pending_requests;
+  gboolean cleanup_started;
 } dt_lib_photo_assistant_t;
 
 typedef struct _request_ctx_t
 {
-  dt_lib_module_t *lib;
+  dt_lib_photo_assistant_t *data;
   gchar *api_key;
   gchar *model;
   gchar *user_prompt;
   gchar *assistant_raw;
   gchar *error_message;
 } _request_ctx_t;
+
+static void _request_ctx_free(_request_ctx_t *ctx)
+{
+  if(!ctx) return;
+  g_free(ctx->api_key);
+  g_free(ctx->model);
+  g_free(ctx->user_prompt);
+  g_free(ctx->assistant_raw);
+  g_free(ctx->error_message);
+  g_free(ctx);
+}
 
 static void _append_chat(dt_lib_photo_assistant_t *d, const char *role, const char *text)
 {
@@ -104,13 +117,22 @@ static gboolean _apply_param_value(dt_iop_module_t *mod,
   switch(field->header.type)
   {
   case DT_INTROSPECTION_TYPE_FLOAT:
-    if(!JSON_NODE_HOLDS_VALUE(val) || json_node_get_value_type(val) != G_TYPE_DOUBLE)
+    if(!JSON_NODE_HOLDS_VALUE(val))
     {
       g_string_append_printf(err, "field `%s` expects a number", field->header.field_name);
       return FALSE;
     }
     {
-      float v = (float)json_node_get_double(val);
+      float v = 0.0f;
+      if(json_node_get_value_type(val) == G_TYPE_DOUBLE)
+        v = (float)json_node_get_double(val);
+      else if(json_node_get_value_type(val) == G_TYPE_INT64)
+        v = (float)json_node_get_int(val);
+      else
+      {
+        g_string_append_printf(err, "field `%s` expects a number", field->header.field_name);
+        return FALSE;
+      }
       if(v < field->Float.Min) v = field->Float.Min;
       if(v > field->Float.Max) v = field->Float.Max;
       *(float *)p = v;
@@ -483,64 +505,72 @@ static char *_openai_chat_sync(const char *api_key,
 static gboolean _idle_finish_request(gpointer user_data)
 {
   _request_ctx_t *ctx = (_request_ctx_t *)user_data;
-  dt_lib_module_t *self = ctx->lib;
-  dt_lib_photo_assistant_t *d = self->data;
-
-  _append_chat(d, "user", ctx->user_prompt);
-
-  GString *combined = g_string_new(NULL);
-
-  if(ctx->error_message)
+  dt_lib_photo_assistant_t *d = ctx->data;
+  if(!d)
   {
-    g_string_append(combined, ctx->error_message);
+    _request_ctx_free(ctx);
+    return G_SOURCE_REMOVE;
   }
-  else if(ctx->assistant_raw)
-  {
-    gchar *parse_buf = g_strdup(ctx->assistant_raw);
-    gboolean stripped = _strip_json_fence(parse_buf);
-    const char *json_text = stripped ? parse_buf : ctx->assistant_raw;
 
-    JsonParser *jp = json_parser_new();
-    GError *je = NULL;
-    const gboolean parsed = json_parser_load_from_data(jp, json_text, -1, &je);
-    if(parsed)
+  if(!d->cleanup_started)
+  {
+    _append_chat(d, "user", ctx->user_prompt);
+
+    GString *combined = g_string_new(NULL);
+
+    if(ctx->error_message)
     {
-      JsonNode *root = json_parser_get_root(jp);
-      if(root && JSON_NODE_HOLDS_OBJECT(root))
+      g_string_append(combined, ctx->error_message);
+    }
+    else if(ctx->assistant_raw)
+    {
+      gchar *parse_buf = g_strdup(ctx->assistant_raw);
+      gboolean stripped = _strip_json_fence(parse_buf);
+      const char *json_text = stripped ? parse_buf : ctx->assistant_raw;
+
+      JsonParser *jp = json_parser_new();
+      GError *je = NULL;
+      const gboolean parsed = json_parser_load_from_data(jp, json_text, -1, &je);
+      if(parsed)
       {
-        JsonObject *jo = json_node_get_object(root);
-        if(json_object_has_member(jo, "reply"))
-          g_string_append_printf(combined, "%s\n", json_object_get_string_member(jo, "reply"));
-        GString *act_log = g_string_new(NULL);
-        _apply_actions_json(json_text, act_log);
-        if(act_log->len)
-          g_string_append_printf(combined, "\n%s", act_log->str);
-        g_string_free(act_log, TRUE);
+        JsonNode *root = json_parser_get_root(jp);
+        if(root && JSON_NODE_HOLDS_OBJECT(root))
+        {
+          JsonObject *jo = json_node_get_object(root);
+          if(json_object_has_member(jo, "reply"))
+            g_string_append_printf(combined, "%s\n", json_object_get_string_member(jo, "reply"));
+          GString *act_log = g_string_new(NULL);
+          _apply_actions_json(json_text, act_log);
+          if(act_log->len)
+            g_string_append_printf(combined, "\n%s", act_log->str);
+          g_string_free(act_log, TRUE);
+        }
+        else
+          g_string_append(combined, ctx->assistant_raw);
       }
       else
-        g_string_append(combined, ctx->assistant_raw);
+      {
+        g_string_append_printf(combined, "%s\n", ctx->assistant_raw);
+        if(je)
+          g_string_append_printf(combined, _("(Could not parse structured reply: %s)\n"), je->message);
+        g_clear_error(&je);
+      }
+      g_object_unref(jp);
+      g_free(parse_buf);
     }
-    else
-    {
-      g_string_append_printf(combined, "%s\n", ctx->assistant_raw);
-      if(je)
-        g_string_append_printf(combined, _("(Could not parse structured reply: %s)\n"), je->message);
-      g_clear_error(&je);
-    }
-    g_object_unref(jp);
-    g_free(parse_buf);
+
+    _append_chat(d, "assistant", combined->str);
+    g_string_free(combined, TRUE);
+
+    d->busy = FALSE;
+    gtk_widget_set_sensitive(d->send_btn, TRUE);
   }
 
-  _append_chat(d, "assistant", combined->str);
-  g_string_free(combined, TRUE);
+  if(d->pending_requests > 0) d->pending_requests--;
+  if(d->cleanup_started && d->pending_requests == 0)
+    g_free(d);
 
-  d->busy = FALSE;
-  gtk_widget_set_sensitive(d->send_btn, TRUE);
-
-  g_free(ctx->user_prompt);
-  g_free(ctx->assistant_raw);
-  g_free(ctx->error_message);
-  g_free(ctx);
+  _request_ctx_free(ctx);
   return G_SOURCE_REMOVE;
 }
 
@@ -564,6 +594,48 @@ static gpointer _request_thread(gpointer data)
 
   gdk_threads_add_idle(_idle_finish_request, ctx);
   return NULL;
+}
+
+static void _on_send(GtkWidget *w, gpointer user_data)
+{
+  (void)w;
+  dt_lib_module_t *mod = (dt_lib_module_t *)user_data;
+  dt_lib_photo_assistant_t *d = mod->data;
+  if(!d || d->busy) return;
+
+  const gchar *text = gtk_entry_get_text(GTK_ENTRY(d->input));
+  if(!text || !*text) return;
+
+  const gchar *env_key = g_getenv("OPENAI_API_KEY");
+  const gchar *entry_key = gtk_entry_get_text(GTK_ENTRY(d->api_key_entry));
+  const gchar *api_key = (env_key && *env_key) ? env_key : entry_key;
+  if(!api_key || !*api_key)
+  {
+    dt_control_log(_("Set OPENAI_API_KEY or enter an API key in the photo assistant panel"));
+    return;
+  }
+
+  gchar *model = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(d->model_combo));
+  if(!model || !*model)
+  {
+    g_free(model);
+    model = g_strdup("gpt-4o-mini");
+  }
+
+  _request_ctx_t *ctx = g_malloc0(sizeof(_request_ctx_t));
+  ctx->data = d;
+  ctx->user_prompt = g_strdup(text);
+  ctx->api_key = g_strdup(api_key);
+  ctx->model = model;
+
+  gtk_entry_set_text(GTK_ENTRY(d->input), "");
+  d->busy = TRUE;
+  gtk_widget_set_sensitive(d->send_btn, FALSE);
+  d->pending_requests++;
+
+  GThread *thread = g_thread_new("photo_assistant_openai", _request_thread, ctx);
+  if(thread)
+    g_thread_unref(thread);
 }
 
 const char *name(dt_lib_module_t *self)
@@ -633,54 +705,18 @@ void gui_init(dt_lib_module_t *self)
   gtk_box_pack_start(GTK_BOX(box), row, FALSE, FALSE, 0);
 
   self->widget = box;
-
-  void on_send(GtkWidget *w, gpointer user_data)
-  {
-    (void)w;
-    dt_lib_module_t *mod = (dt_lib_module_t *)user_data;
-    dt_lib_photo_assistant_t *dd = mod->data;
-    if(dd->busy) return;
-
-    const gchar *text = gtk_entry_get_text(GTK_ENTRY(dd->input));
-    if(!text || !*text) return;
-
-    const gchar *env_key = g_getenv("OPENAI_API_KEY");
-    const gchar *entry_key = gtk_entry_get_text(GTK_ENTRY(dd->api_key_entry));
-    const gchar *api_key = (env_key && *env_key) ? env_key : entry_key;
-    if(!api_key || !*api_key)
-    {
-      dt_control_log(_("Set OPENAI_API_KEY or enter an API key in the photo assistant panel"));
-      return;
-    }
-
-    gchar *model = gtk_combo_box_text_get_active_text(GTK_COMBO_BOX_TEXT(dd->model_combo));
-    if(!model || !*model)
-    {
-      g_free(model);
-      model = g_strdup("gpt-4o-mini");
-    }
-
-    _request_ctx_t *ctx = g_malloc0(sizeof(_request_ctx_t));
-    ctx->lib = mod;
-    ctx->user_prompt = g_strdup(text);
-    ctx->api_key = g_strdup(api_key);
-    ctx->model = model;
-
-    gtk_entry_set_text(GTK_ENTRY(dd->input), "");
-    dd->busy = TRUE;
-    gtk_widget_set_sensitive(dd->send_btn, FALSE);
-
-    g_thread_new("photo_assistant_openai", _request_thread, ctx);
-  }
-
-  g_signal_connect(G_OBJECT(d->send_btn), "clicked", G_CALLBACK(on_send), self);
-  g_signal_connect(G_OBJECT(d->input), "activate", G_CALLBACK(on_send), self);
+  g_signal_connect(G_OBJECT(d->send_btn), "clicked", G_CALLBACK(_on_send), self);
+  g_signal_connect(G_OBJECT(d->input), "activate", G_CALLBACK(_on_send), self);
 }
 
 void gui_cleanup(dt_lib_module_t *self)
 {
-  g_free(self->data);
+  dt_lib_photo_assistant_t *d = self->data;
   self->data = NULL;
+  if(!d) return;
+  d->cleanup_started = TRUE;
+  if(d->pending_requests == 0)
+    g_free(d);
 }
 
 // clang-format off
