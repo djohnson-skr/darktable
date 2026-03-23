@@ -588,8 +588,32 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
   }
 
   JsonObject *choice = json_array_get_object_element(choices, 0);
+  if(!choice || !json_object_has_member(choice, "message"))
+  {
+    if(error_message) *error_message = g_strdup(_("OpenAI response choice did not contain message"));
+    g_object_unref(parser);
+    g_string_free(response, TRUE);
+    return NULL;
+  }
+
   JsonObject *message = json_object_get_object_member(choice, "message");
+  if(!message || !json_object_has_member(message, "content"))
+  {
+    if(error_message) *error_message = g_strdup(_("OpenAI response message did not contain content"));
+    g_object_unref(parser);
+    g_string_free(response, TRUE);
+    return NULL;
+  }
+
   const gchar *raw_content = json_object_get_string_member(message, "content");
+  if(!raw_content)
+  {
+    if(error_message) *error_message = g_strdup(_("OpenAI response content was missing or not a string"));
+    g_object_unref(parser);
+    g_string_free(response, TRUE);
+    return NULL;
+  }
+
   gchar *result = _extract_json_content(raw_content);
 
   g_object_unref(parser);
@@ -1177,7 +1201,8 @@ static void _send_clicked(GtkButton *button, gpointer user_data)
   _set_status(d, _("asking OpenAI for an edit plan..."));
   _set_text_buffer(GTK_TEXT_VIEW(d->response_view), _("Working..."));
 
-  g_thread_new("photo-assistant", _photo_assistant_thread, request);
+  GThread *thread = g_thread_new("photo-assistant", _photo_assistant_thread, request);
+  g_thread_unref(thread);
 }
 
 const char *name(dt_lib_module_t *self)
