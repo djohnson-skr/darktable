@@ -55,6 +55,7 @@
 #include "imageio/imageio_common.h"
 #include "imageio/imageio_module.h"
 #include "libs/colorpicker.h"
+#include "libs/lib.h"
 #include "views/view.h"
 #include "views/view_api.h"
 
@@ -1511,6 +1512,21 @@ static void _darkroom_ui_apply_style_popupmenu(GtkWidget *w,
     dt_control_log(_("no styles have been created yet"));
 }
 
+static void _darkroom_ui_open_photo_assistant(GtkWidget *w, gpointer user_data)
+{
+  dt_lib_module_t *assistant = dt_lib_get_module("photo_assistant");
+  if(!assistant)
+  {
+    dt_control_log(_("photo assistant is unavailable"));
+    return;
+  }
+
+  dt_ui_panel_show(darktable.gui->ui, DT_UI_PANEL_RIGHT, TRUE, TRUE);
+  dt_lib_set_visible(assistant, TRUE);
+  dt_lib_gui_set_expanded(assistant, TRUE);
+  dt_ui_notify_user();
+}
+
 static void _second_window_quickbutton_clicked(GtkWidget *w,
                                                dt_develop_t *dev)
 {
@@ -2505,6 +2521,14 @@ void gui_init(dt_view_t *self)
   dt_gui_add_help_link(styles, "bottom_panel_styles");
   dt_view_manager_view_toolbox_add(darktable.view_manager, styles, DT_VIEW_DARKROOM);
   /* ensure that we get strings from the style files shipped with darktable localized */
+
+  GtkWidget *photo_assistant = dtgtk_button_new(dtgtk_cairo_paint_text_label, 0, NULL);
+  dt_action_define(sa, NULL, N_("photo assistant"), photo_assistant, &dt_action_def_button);
+  g_signal_connect(G_OBJECT(photo_assistant), "clicked",
+                   G_CALLBACK(_darkroom_ui_open_photo_assistant), NULL);
+  gtk_widget_set_tooltip_text(photo_assistant,
+                              _("open the photo assistant to edit the current image with natural language"));
+  dt_view_manager_view_toolbox_add(darktable.view_manager, photo_assistant, DT_VIEW_DARKROOM);
 
   /* create second window display button */
   dev->second_wnd_button = dtgtk_togglebutton_new(dtgtk_cairo_paint_display2, 0, NULL);
