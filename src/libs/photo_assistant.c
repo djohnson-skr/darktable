@@ -209,39 +209,38 @@ static gboolean _apply_param_value(dt_iop_module_t *mod,
   return TRUE;
 }
 
-static gboolean _apply_actions_json(const char *json_text, GString *log)
+static gboolean _is_allowed_module_op(const gchar *op)
 {
-  JsonParser *parser = json_parser_new();
-  GError *error = NULL;
-  if(!json_parser_load_from_data(parser, json_text, -1, &error))
+  return g_strcmp0(op, "vignette") == 0 || g_strcmp0(op, "colorbalancergb") == 0
+         || g_strcmp0(op, "diffuse") == 0 || g_strcmp0(op, "blurs") == 0;
+}
+
+static gboolean _get_allowed_module(const gchar *op, dt_iop_module_t **mod, GString *log)
+{
+  if(!op) return FALSE;
+
+  if(!_is_allowed_module_op(op))
   {
-    g_string_append_printf(log, _("Could not parse assistant JSON: %s\n"), error->message);
-    g_clear_error(&error);
-    g_object_unref(parser);
+    g_string_append_printf(log, _("Module `%s` is not allowed\n"), op);
     return FALSE;
   }
 
-  JsonNode *root = json_parser_get_root(parser);
-  if(!root || !JSON_NODE_HOLDS_OBJECT(root))
+  *mod = dt_iop_get_module(op);
+  if(!*mod)
   {
-    g_string_append(log, _("Assistant reply is not a JSON object.\n"));
-    g_object_unref(parser);
+    g_string_append_printf(log, _("Unknown module `%s`\n"), op);
     return FALSE;
   }
 
-  JsonObject *obj = json_node_get_object(root);
-  if(!json_object_has_member(obj, "actions"))
-  {
-    g_string_append(log, _("No \"actions\" array in assistant reply.\n"));
-    g_object_unref(parser);
-    return FALSE;
-  }
+  return TRUE;
+}
 
+static gboolean _apply_actions_json(JsonObject *obj, GString *log)
+{
   JsonNode *actions_node = json_object_get_member(obj, "actions");
   if(!actions_node || !JSON_NODE_HOLDS_ARRAY(actions_node))
   {
     g_string_append(log, _("No \"actions\" array in assistant reply.\n"));
-    g_object_unref(parser);
     return FALSE;
   }
 
@@ -262,15 +261,11 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
     if(g_strcmp0(type, "enable_module") == 0)
     {
       const gchar *op = json_object_get_string_member(a, "op");
-      if(!op)
+      dt_iop_module_t *mod = NULL;
+      if(!_get_allowed_module(op, &mod, log))
       {
-        g_string_append(log, _("enable_module: missing op\n"));
-        continue;
-      }
-      dt_iop_module_t *mod = dt_iop_get_module(op);
-      if(!mod)
-      {
-        g_string_append_printf(log, _("Unknown module `%s`\n"), op);
+        if(!op)
+          g_string_append(log, _("enable_module: missing op\n"));
         continue;
       }
       gboolean en = TRUE;
@@ -284,15 +279,11 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
     else if(g_strcmp0(type, "reset_module") == 0)
     {
       const gchar *op = json_object_get_string_member(a, "op");
-      if(!op)
+      dt_iop_module_t *mod = NULL;
+      if(!_get_allowed_module(op, &mod, log))
       {
-        g_string_append(log, _("reset_module: missing op\n"));
-        continue;
-      }
-      dt_iop_module_t *mod = dt_iop_get_module(op);
-      if(!mod)
-      {
-        g_string_append_printf(log, _("Unknown module `%s`\n"), op);
+        if(!op)
+          g_string_append(log, _("reset_module: missing op\n"));
         continue;
       }
       dt_iop_load_default_params(mod);
@@ -309,12 +300,9 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
         g_string_append(log, _("set_param: need op, field, value\n"));
         continue;
       }
-      dt_iop_module_t *mod = dt_iop_get_module(op);
-      if(!mod)
-      {
-        g_string_append_printf(log, _("Unknown module `%s`\n"), op);
+      dt_iop_module_t *mod = NULL;
+      if(!_get_allowed_module(op, &mod, log))
         continue;
-      }
       if(!mod->so->have_introspection)
       {
         g_string_append_printf(log, _("Module `%s` has no introspection\n"), op);
@@ -345,8 +333,6 @@ static gboolean _apply_actions_json(const char *json_text, GString *log)
         g_string_append_printf(log, "%s\n", json_object_get_string_member(a, "text"));
     }
   }
-
-  g_object_unref(parser);
 
   if(any)
     dt_dev_reprocess_center(darktable.develop);
@@ -547,7 +533,7 @@ static gboolean _idle_finish_request(gpointer user_data)
           if(json_object_has_member(jo, "reply"))
             g_string_append_printf(combined, "%s\n", json_object_get_string_member(jo, "reply"));
           GString *act_log = g_string_new(NULL);
-          _apply_actions_json(json_text, act_log);
+          _apply_actions_json(jo, act_log);
           if(act_log->len)
             g_string_append_printf(combined, "\n%s", act_log->str);
           g_string_free(act_log, TRUE);
