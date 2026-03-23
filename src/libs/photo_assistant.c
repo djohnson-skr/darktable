@@ -1068,7 +1068,7 @@ static gchar *_call_openai_chat_completions(const gchar *api_key,
 
   g_object_unref(parser);
   g_string_free(response, TRUE);
-  if(!result && error_message && !*error_message && tool_error)
+  if(error_message && !*error_message && tool_error)
     *error_message = tool_error;
   else
     g_free(tool_error);
@@ -1508,6 +1508,12 @@ static gboolean _request_finished(gpointer user_data)
   dt_photo_assistant_result_t *result = (dt_photo_assistant_result_t *)user_data;
   dt_lib_module_t *self = result->self;
   dt_lib_photo_assistant_t *d = self->data;
+
+  if(!d)
+  {
+    _free_result(result);
+    return G_SOURCE_REMOVE;
+  }
 
   if(result->request_id != d->request_id)
   {
